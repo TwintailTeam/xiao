@@ -60,8 +60,8 @@ const KEEP_ON_HOST: &[&str] = &[
     "libglib-2.0",
     "libgobject-2.0",
     "libgmodule-2.0",
+    "libpcre2",
     "libdbus-1",
-    "libselinux",
     "libudev",
     "libsystemd",
     "libasound",
@@ -239,8 +239,7 @@ fn stage_libraries(qt: &QtPaths, dir: &Path, binary: &Path, arch: &str) -> Resul
         collect_shared_objects(&dir.join(staged), &mut roots);
     }
 
-    let wanted: Vec<(String, PathBuf)> =
-        linked_libraries(&roots, &qt.libs, arch).into_iter().filter(|(name, _)| !KEEP_ON_HOST.iter().any(|host| name.starts_with(host))).collect();
+    let wanted: Vec<(String, PathBuf)> = linked_libraries(&roots, &qt.libs, arch).into_iter().collect();
 
     let lib_dir = dir.join("usr/lib");
     std::fs::create_dir_all(&lib_dir).map_err(|e| format!("{}: {e}", lib_dir.display()))?;
@@ -288,7 +287,7 @@ fn linked_libraries(roots: &[PathBuf], qt_libs: &Path, arch: &str) -> BTreeMap<S
     while let Some(file) = queue.pop() {
         let Some(linked) = read_linked(&file) else { continue };
         for name in linked.needed {
-            if found.contains_key(&name) || missing.contains(&name) {
+            if found.contains_key(&name) || missing.contains(&name) || KEEP_ON_HOST.iter().any(|host| name.starts_with(host)) {
                 continue;
             }
             let dirs = linked.search.iter().map(PathBuf::as_path).chain([qt_libs]).chain(system.iter().map(PathBuf::as_path));
