@@ -1,0 +1,17 @@
+[package]
+name = "xiao-sfx"
+description = "Self-extracting launcher for xiao's windows-sfx bundles"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["TwintailTeam"]
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

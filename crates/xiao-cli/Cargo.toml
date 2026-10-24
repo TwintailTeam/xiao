@@ -1,0 +1,23 @@
+[package]
+name = "xiao-cli"
+description = "Dev server and bundler for xiao apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "xiao"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+tar.workspace = true
+flate2.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+goblin.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+backhand.workspace = true

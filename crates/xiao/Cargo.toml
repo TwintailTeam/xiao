@@ -1,0 +1,19 @@
+[package]
+name = "xiao"
+description = "Desktop apps with a web frontend, rendered by Qt 6 and QtWebEngine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+links = "xiao"
+
+[dependencies]
+cxx.workspace = true
+cxx-qt.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[build-dependencies]
+cxx-qt-build.workspace = true

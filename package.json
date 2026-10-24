@@ -1,0 +1,20 @@
+{
+    "name": "@xiao/api",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "description": "Frontend API for xiao apps",
+    "author": "TwintailTeam",
+    "license": "MIT OR Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/TwintailTeam/xiao.git"
+    },
+    "files": [
+        "packages/api/src"
+    ],
+    "exports": {
+        ".": "./packages/api/src/index.ts"
+    },
+    "types": "./packages/api/src/index.ts"
+}
