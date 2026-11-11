@@ -23,6 +23,7 @@ pub fn stage(conf: &Conf, dir: &Path, exe: &Path, arch: &str) -> Result<usize, S
 
     let qt = QtPaths::query()?;
     let prune = Prune::from_conf(conf);
+    qt.stage_notices(&dir.join("qt-notices"))?;
     let Some(process) = [&qt.libexecs, &qt.bins].into_iter().map(|dir| dir.join("QtWebEngineProcess.exe")).find(|path| path.is_file()) else {
         return Err(format!("QtWebEngineProcess.exe not found in {} or {} (install the qtwebengine module)", qt.libexecs.display(), qt.bins.display()));
     };
@@ -53,16 +54,14 @@ pub fn stage(conf: &Conf, dir: &Path, exe: &Path, arch: &str) -> Result<usize, S
     }
 
     let mut roots = vec![staged, dir.join("QtWebEngineProcess.exe")];
-    collect_dlls(&dir.join("plugins"), &mut roots);
-    collect_dlls(&dir.join("qml"), &mut roots);
+    roots.extend(dlls_in(&dir.join("plugins")).chain(dlls_in(&dir.join("qml"))));
     let copied = stage_dlls(&roots, &qt.bins, arch, dir)?;
     check_symbols(dir, &qt.bins)?;
     Ok(copied)
 }
 
 fn check_symbols(dir: &Path, qt_bins: &Path) -> Result<(), String> {
-    let mut files = Vec::new();
-    collect_dlls(dir, &mut files);
+    let mut files: Vec<PathBuf> = dlls_in(dir).collect();
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))));
 
@@ -119,7 +118,13 @@ fn stage_dlls(roots: &[PathBuf], qt_bins: &Path, arch: &str, dest: &Path) -> Res
                 queue.push(target);
                 copied += 1;
             } else if key.starts_with("vcruntime") || key.starts_with("msvcp") || key.starts_with("concrt") {
-                let crt = crt_dlls.get_or_insert_with(|| crt_listing(arch));
+                let crt = crt_dlls.get_or_insert_with(|| match crate::vcredist::crt_dir(arch) {
+                    Ok(dir) => listing(&dir),
+                    Err(e) => {
+                        log("warn", YELLOW, &format!("windows-portable: MSVC runtime not bundled ({e}), target PCs need the VC++ Redistributable"));
+                        HashMap::new()
+                    }
+                });
                 if let Some(source) = crt.get(&key) {
                     copy_file(source, &dest.join(&import))?;
                     copied += 1;
@@ -128,16 +133,6 @@ fn stage_dlls(roots: &[PathBuf], qt_bins: &Path, arch: &str, dest: &Path) -> Res
         }
     }
     Ok(copied)
-}
-
-fn crt_listing(arch: &str) -> HashMap<String, PathBuf> {
-    match crate::vcredist::crt_dir(arch) {
-        Ok(dir) => listing(&dir),
-        Err(e) => {
-            log("warn", YELLOW, &format!("windows-portable: MSVC runtime not bundled ({e}), target PCs need the VC++ Redistributable"));
-            HashMap::new()
-        }
-    }
 }
 
 pub fn imports(file: &Path) -> Vec<String> {
@@ -158,14 +153,6 @@ fn listing(dir: &Path) -> HashMap<String, PathBuf> {
         .collect()
 }
 
-fn collect_dlls(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_dlls(&path, found);
-        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")) {
-            found.push(path);
-        }
-    }
+fn dlls_in(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    files_in(dir).into_iter().filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
 }

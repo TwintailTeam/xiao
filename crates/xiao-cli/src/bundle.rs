@@ -1,7 +1,10 @@
 use crate::conf::Conf;
 use crate::util::*;
+#[cfg(target_os = "linux")]
 use md5::Digest as _;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 
 pub struct Options {
     pub targets: Vec<String>,
@@ -9,6 +12,7 @@ pub struct Options {
     pub runner: Option<String>,
     pub no_bundle: bool,
     pub debug: bool,
+    pub config: Vec<String>,
 }
 
 const KNOWN: &[&str] = &["deb", "rpm", "appimage", "windows-portable", "windows-sfx", "macos-app"];
@@ -16,7 +20,7 @@ const KNOWN: &[&str] = &["deb", "rpm", "appimage", "windows-portable", "windows-
 pub fn run(conf: &Conf, opts: &Options) -> Result<(), String> {
     if opts.no_bundle {
         build_release(conf, opts)?;
-        ok(&format!("binary → {}", release_dir(conf, opts).join(binary_file(conf, opts)).display()));
+        log("ok", GREEN, &format!("binary → {}", release_dir(conf, opts).join(binary_file(conf, opts)).display()));
         return Ok(());
     }
 
@@ -30,54 +34,68 @@ pub fn run(conf: &Conf, opts: &Options) -> Result<(), String> {
     let out = out_dir(conf, opts);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
 
-    info(&format!("{} {} → {}", conf.product_name(), conf.version(), targets.join(", ")));
+    log("bundle", CYAN, &format!("{} {} → {}", conf.product_name(), conf.version(), targets.join(", ")));
 
     build_release(conf, opts)?;
 
     if let Some(before) = conf.str_at(&["build", "beforeBundleCommand"]) {
-        info(&format!("beforeBundleCommand: {before}"));
+        log("bundle", CYAN, &format!("beforeBundleCommand: {before}"));
         run_shell(before, &conf.root)?;
     }
 
+    let os = target_os(opts);
+    let arch = target_arch(opts);
     let mut failures = 0;
     for target in &targets {
+        let unbuildable = match target.as_str() {
+            "deb" | "rpm" | "appimage" if os != "linux" || !cfg!(target_os = "linux") => Some("only built on Linux, for Linux"),
+            "windows-portable" | "windows-sfx" if os != "windows" => Some("only built for Windows (--target x86_64-pc-windows-msvc)"),
+            "macos-app" if os != "macos" || !cfg!(target_os = "macos") => Some("only built on macOS, for macOS"),
+            _ => None,
+        };
+        if let Some(reason) = unbuildable {
+            log("skip", YELLOW, &format!("{target}: {reason}"));
+            continue;
+        }
+
         let result = match target.as_str() {
+            #[cfg(target_os = "linux")]
             "deb" => deb(conf, opts),
+            #[cfg(target_os = "linux")]
             "rpm" => rpm_package(conf, opts),
-            "appimage" => appimage(conf, opts),
-            "windows-portable" => windows_portable(conf, opts),
+            #[cfg(target_os = "linux")]
+            "appimage" => built_binary(conf, opts).and_then(|binary| crate::appimage::build(conf, &out, arch, &binary)),
+            "windows-portable" => built_binary(conf, opts).and_then(|exe| crate::windows_portable::build(conf, &out, &exe, arch)),
             "windows-sfx" => windows_sfx(conf, opts),
-            "macos-app" => macos_app(conf, opts),
+            "macos-app" => built_binary(conf, opts).and_then(|binary| crate::macos::build(conf, &out, &binary)),
             _ => unreachable!("targets are validated above"),
         };
         if let Err(e) = result {
             failures += 1;
-            fail(&format!("{target}: {e}"));
+            log("error", RED, &format!("{target}: {e}"));
         }
     }
 
     if let Ok(qt) = crate::qt::QtPaths::query()
         && qt.proprietary_codecs() == Some(false)
     {
-        warn(&format!(
-            "the QtWebEngine in {} is built without proprietary codecs: H.264, HEVC and AAC will not play, AV1, VP9, Opus, FLAC and MP3 will (in MP4 or WebM)",
-            qt.libs.display()
-        ));
+        log(
+            "warn",
+            YELLOW,
+            &format!(
+                "the QtWebEngine in {} is built without proprietary codecs: H.264, HEVC and AAC will not play, AV1, VP9, Opus, FLAC and MP3 will (in MP4 or WebM)",
+                qt.libs.display()
+            ),
+        );
     }
 
     println!();
     if failures > 0 {
         return Err(format!("{failures} target(s) failed"));
     }
-    ok(&format!("bundles in {}", out.display()));
+    log("ok", GREEN, &format!("bundles in {}", out.display()));
     Ok(())
 }
-
-fn info(m: &str) { log("bundle", CYAN, m); }
-fn ok(m: &str) { log("ok", GREEN, m); }
-fn warn(m: &str) { log("warn", YELLOW, m); }
-fn skip(m: &str) { log("skip", YELLOW, m); }
-fn fail(m: &str) { log("error", RED, m); }
 
 fn build_release(conf: &Conf, opts: &Options) -> Result<(), String> {
     let universal = opts.triple.as_deref() == Some(UNIVERSAL);
@@ -98,7 +116,7 @@ fn build_release(conf: &Conf, opts: &Options) -> Result<(), String> {
     }
 
     if let Some(before) = conf.str_at(&["build", "beforeBuildCommand"]) {
-        info(&format!("beforeBuildCommand: {before}"));
+        log("bundle", CYAN, &format!("beforeBuildCommand: {before}"));
         run_shell(before, &conf.root)?;
     }
 
@@ -109,7 +127,7 @@ fn build_release(conf: &Conf, opts: &Options) -> Result<(), String> {
         let name = binary_file(conf, opts);
         let slices: Vec<PathBuf> = UNIVERSAL_SLICES.iter().map(|triple| conf.target_dir().join(triple).join(profile(opts)).join(&name)).collect();
         crate::fat::merge(&slices, &release_dir(conf, opts).join(&name))?;
-        info(&format!("merged {} into {UNIVERSAL}", UNIVERSAL_SLICES.join(" + ")));
+        log("bundle", CYAN, &format!("merged {} into {UNIVERSAL}", UNIVERSAL_SLICES.join(" + ")));
     } else {
         cargo_build(conf, opts, opts.triple.as_deref())?;
     }
@@ -141,10 +159,9 @@ fn cargo_build(conf: &Conf, opts: &Options, triple: Option<&str>) -> Result<(), 
     let mut args = cargo_args(opts, triple);
     args.push("--workspace".to_owned());
 
-    info(&format!("cargo {}", args.join(" ")));
+    log("bundle", CYAN, &format!("cargo {}", args.join(" ")));
 
-    let status =
-        std::process::Command::new("cargo").args(&args).current_dir(&conf.app).envs(crate::qt::cargo_env()?).status().map_err(|e| format!("cargo: {e}"))?;
+    let status = conf.cargo()?.args(&args).status().map_err(|e| format!("cargo: {e}"))?;
     if !status.success() {
         return Err(format!("release build failed ({status})"));
     }
@@ -162,7 +179,7 @@ fn release_dir(conf: &Conf, opts: &Options) -> PathBuf {
 
 fn out_dir(conf: &Conf, opts: &Options) -> PathBuf { release_dir(conf, opts).join("bundle") }
 
-fn target_os(opts: &Options) -> &'static str {
+pub fn target_os(opts: &Options) -> &'static str {
     match opts.triple.as_deref() {
         Some(triple) if triple.contains("windows") => "windows",
         Some(triple) if triple.contains("apple") => "macos",
@@ -185,20 +202,9 @@ fn built_binary(conf: &Conf, opts: &Options) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn stage_payload(conf: &Conf, opts: &Options, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-
-    let name = conf.binary_name();
-    copy_file(&built_binary(conf, opts)?, &dest.join(name))?;
-    make_executable(&dest.join(name))?;
-
-    stage_resources(conf, &dest.parent().unwrap_or(dest).join("lib").join(conf.identifier()))?;
-    Ok(())
-}
-
 pub(crate) fn desktop_entry(conf: &Conf) -> String {
-    let name = conf.product_name();
-    let mut lines = vec!["[Desktop Entry]".to_owned(), "Type=Application".to_owned(), format!("Name={name}")];
+    let name = conf.binary_name();
+    let mut lines = vec!["[Desktop Entry]".to_owned(), "Type=Application".to_owned(), format!("Name={}", conf.product_name())];
     if let Some(generic) = conf.str_at(&["bundle", "linux", "desktop", "genericName"]) {
         lines.push(format!("GenericName={generic}"));
     }
@@ -222,29 +228,30 @@ pub(crate) fn desktop_entry(conf: &Conf) -> String {
     lines.join("\n")
 }
 
-fn deb_arch(opts: &Options) -> &str {
-    match target_arch(opts) {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn stage_linux_tree(conf: &Conf, opts: &Options, stage: &Path) -> Result<(), String> {
-    let name = conf.product_name();
+    let name = conf.binary_name();
+    let identifier = conf.identifier();
+    if !identifier.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return Err(format!("`{identifier}` names folders under /usr: it may only contain letters, digits, `.`, `-` and `_`"));
+    }
     reset_dir(stage)?;
 
-    let installed = stage.join("usr/bin").join(name);
-    copy_file(&built_binary(conf, opts)?, &installed)?;
-    make_executable(&installed)?;
+    let runtime = format!("usr/libexec/{identifier}");
+    let copied = crate::appimage::stage_runtime(conf, &stage.join(&runtime), &built_binary(conf, opts)?, target_arch(opts))?;
+    log("bundle", CYAN, &format!("{copied} shared libraries in /{runtime}"));
 
-    stage_resources(conf, &stage.join("usr/lib").join(conf.identifier()))?;
+    let launcher = stage.join("usr/bin").join(name);
+    write(&launcher, crate::appimage::launcher_script(&format!("/{runtime}"), name))?;
+    make_executable(&launcher)?;
 
-    write(&stage.join("usr/share/applications").join(format!("{name}.desktop")), &desktop_entry(conf))?;
+    stage_resources(conf, &stage.join("usr/lib").join(identifier))?;
+
+    write(&stage.join("usr/share/applications").join(format!("{name}.desktop")), desktop_entry(conf))?;
 
     let pngs = conf.icon_pngs();
     if pngs.is_empty() {
-        warn("no PNG in bundle.icon: the package will have no icon");
+        log("warn", YELLOW, "no PNG in bundle.icon: the package will have no icon");
     }
     for (size, png) in pngs {
         copy_file(&png, &stage.join(format!("usr/share/icons/hicolor/{size}x{size}/apps")).join(format!("{name}.png")))?;
@@ -252,25 +259,27 @@ fn stage_linux_tree(conf: &Conf, opts: &Options, stage: &Path) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn deb(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if !cfg!(target_os = "linux") || target_os(opts) != "linux" {
-        skip("deb: only built on Linux, for Linux");
-        return Ok(());
-    }
-
-    let name = conf.product_name();
+    let package = conf.package_name();
+    let name = package.as_str();
     let version = conf.version();
-    let arch = deb_arch(opts);
+    let arch = match target_arch(opts) {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
     let out = out_dir(conf, opts);
     let stage = out.join("deb").join(format!("{name}_{version}_{arch}"));
     stage_linux_tree(conf, opts, &stage)?;
 
     let depends = conf.strings_at(&["bundle", "linux", "deb", "depends"]);
+    let maintainer = conf.str_at(&["bundle", "linux", "deb", "maintainer"]).or_else(|| conf.str_at(&["bundle", "publisher"])).unwrap_or(name);
     let mut control = vec![
         format!("Package: {name}"),
         format!("Version: {version}"),
         format!("Architecture: {arch}"),
-        format!("Maintainer: {}", conf.str_at(&["bundle", "publisher"]).unwrap_or(name)),
+        format!("Maintainer: {maintainer}"),
         format!("Installed-Size: {}", dir_size_kib(&stage)),
     ];
     if !depends.is_empty() {
@@ -281,11 +290,18 @@ fn deb(conf: &Conf, opts: &Options) -> Result<(), String> {
     if let Some(homepage) = conf.str_at(&["bundle", "homepage"]) {
         control.push(format!("Homepage: {homepage}"));
     }
-    control.push(format!("Description: {}", conf.str_at(&["bundle", "shortDescription"]).unwrap_or(name)));
-    control.push(format!(" {}", conf.str_at(&["bundle", "longDescription"]).unwrap_or("").replace('\n', "\n ")));
+    control.push(format!("Description: {}", conf.str_at(&["bundle", "shortDescription"]).unwrap_or(conf.product_name())));
+    for line in conf.str_at(&["bundle", "longDescription"]).unwrap_or("").lines() {
+        control.push(if line.trim().is_empty() { " .".to_owned() } else { format!(" {}", line.trim_end()) });
+    }
     control.push(String::new());
 
-    let sums = md5sums(&stage)?;
+    let mut sums = String::new();
+    for relative in relative_files(&stage) {
+        let path = stage.join(&relative);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        sums.push_str(&format!("{}  {relative}\n", hex(&md5::Md5::digest(&bytes))));
+    }
     let control_tar = targz(|builder| {
         for (path, body) in [("./control", control.join("\n")), ("./md5sums", sums)] {
             let mut header = tar::Header::new_gnu();
@@ -302,47 +318,19 @@ fn deb(conf: &Conf, opts: &Options) -> Result<(), String> {
     let _ = std::fs::remove_file(&deb_path);
     let mut archive = b"!<arch>\n".to_vec();
     for (entry, bytes) in [("debian-binary", b"2.0\n".to_vec()), ("control.tar.gz", control_tar), ("data.tar.gz", data_tar)] {
-        archive.extend_from_slice(format!("{entry:<16}{:<12}{:<6}{:<6}{:<8o}{:<10}`\n", 0, 0, 0, 0, bytes.len()).as_bytes());
+        archive.extend_from_slice(format!("{entry:<16}{:<12}{:<6}{:<6}{:<8o}{:<10}`\n", 0, 0, 0, 0o100644, bytes.len()).as_bytes());
         archive.extend_from_slice(&bytes);
         if !bytes.len().is_multiple_of(2) {
             archive.push(b'\n');
         }
     }
-    std::fs::write(&deb_path, archive).map_err(|e| format!("{}: {e}", deb_path.display()))?;
+    write(&deb_path, archive)?;
 
-    ok(&format!("deb → {}", deb_path.display()));
+    log("ok", GREEN, &format!("deb → {}", deb_path.display()));
     Ok(())
 }
 
-fn md5sums(stage: &Path) -> Result<String, String> {
-    let mut files = Vec::new();
-    list_files(stage, stage, &mut files);
-    files.sort();
-
-    let mut lines = String::new();
-    for relative in &files {
-        let path = stage.join(relative);
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let digest: String = md5::Md5::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
-        lines.push_str(&format!("{digest}  {relative}\n"));
-    }
-    Ok(lines)
-}
-
-fn list_files(base: &Path, dir: &Path, found: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            list_files(base, &path, found);
-        } else if let Ok(relative) = path.strip_prefix(base) {
-            found.push(relative.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
-        }
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn targz(fill: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>) -> std::io::Result<()>) -> Result<Vec<u8>, String> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
@@ -353,11 +341,8 @@ fn targz(fill: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>)
 
 #[cfg(target_os = "linux")]
 fn rpm_package(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if target_os(opts) != "linux" {
-        skip("rpm: only built on Linux, for Linux");
-        return Ok(());
-    }
-    let name = conf.product_name();
+    let package = conf.package_name();
+    let name = package.as_str();
     let version = conf.version();
     let arch = target_arch(opts);
     let release = conf.str_at(&["bundle", "linux", "rpm", "release"]).unwrap_or("1");
@@ -387,53 +372,18 @@ fn rpm_package(conf: &Conf, opts: &Options) -> Result<(), String> {
     let _ = std::fs::remove_file(&path);
     crate::rpm::write(&stage, &meta, &path)?;
 
-    ok(&format!("rpm → {}", path.display()));
+    log("ok", GREEN, &format!("rpm → {}", path.display()));
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rpm_package(_conf: &Conf, _opts: &Options) -> Result<(), String> {
-    skip("rpm: only built on Linux, for Linux");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn appimage(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if target_os(opts) != "linux" {
-        skip("appimage: only built on Linux, for Linux");
-        return Ok(());
-    }
-    crate::appimage::build(conf, &out_dir(conf, opts), target_arch(opts), |bin_dir| stage_payload(conf, opts, bin_dir))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn appimage(_conf: &Conf, _opts: &Options) -> Result<(), String> {
-    skip("appimage: only built on Linux, for Linux");
-    Ok(())
-}
-
-fn windows_portable(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if target_os(opts) != "windows" {
-        skip("windows-portable: only built for Windows (--target x86_64-pc-windows-msvc)");
-        return Ok(());
-    }
-
-    crate::windows_portable::build(conf, &out_dir(conf, opts), &built_binary(conf, opts)?, target_arch(opts))
 }
 
 fn windows_sfx(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if target_os(opts) != "windows" {
-        skip("windows-sfx: only built for Windows (--target x86_64-pc-windows-msvc)");
-        return Ok(());
-    }
-
     let project = crate::windows_sfx::stub_project(conf)?;
     let target_dir = project.join("target");
     let mut args = cargo_args(opts, opts.triple.as_deref());
     args.push("--target-dir".to_owned());
     args.push(target_dir.display().to_string());
 
-    info(&format!("cargo {} (windows-sfx launcher)", args.join(" ")));
+    log("bundle", CYAN, &format!("cargo {} (windows-sfx launcher)", args.join(" ")));
     let status = std::process::Command::new("cargo").args(&args).current_dir(&project).status().map_err(|e| format!("cargo: {e}"))?;
     if !status.success() {
         return Err(format!("launcher build failed ({status})"));
@@ -445,11 +395,3 @@ fn windows_sfx(conf: &Conf, opts: &Options) -> Result<(), String> {
 }
 
 fn target_arch(opts: &Options) -> &str { opts.triple.as_deref().and_then(|triple| triple.split('-').next()).unwrap_or(std::env::consts::ARCH) }
-
-fn macos_app(conf: &Conf, opts: &Options) -> Result<(), String> {
-    if !cfg!(target_os = "macos") || target_os(opts) != "macos" {
-        skip("macos-app: only built on macOS, for macOS");
-        return Ok(());
-    }
-    crate::macos::build(conf, &out_dir(conf, opts), &built_binary(conf, opts)?)
-}

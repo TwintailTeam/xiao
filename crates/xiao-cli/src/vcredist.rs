@@ -16,7 +16,12 @@ pub fn crt_dir(arch: &str) -> Result<PathBuf, String> {
 
     if let Some(redist) = std::env::var_os("VCToolsRedistDir") {
         let dir = PathBuf::from(redist).join(arch);
-        return newest_crt(&dir).ok_or_else(|| format!("VCToolsRedistDir has no {}/Microsoft.VC*.CRT", dir.display()));
+        let is_crt = |path: &PathBuf| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            path.is_dir() && name.starts_with("Microsoft.VC") && name.ends_with(".CRT")
+        };
+        let newest = std::fs::read_dir(&dir).ok().and_then(|entries| entries.flatten().map(|entry| entry.path()).filter(is_crt).max());
+        return newest.ok_or_else(|| format!("VCToolsRedistDir has no {}/Microsoft.VC*.CRT", dir.display()));
     }
 
     let cache = cache_root()?.join("xiao/vcredist").join(arch);
@@ -24,20 +29,6 @@ pub fn crt_dir(arch: &str) -> Result<PathBuf, String> {
         download(arch, &cache)?;
     }
     Ok(cache)
-}
-
-fn newest_crt(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut found: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            path.is_dir() && name.starts_with("Microsoft.VC") && name.ends_with(".CRT")
-        })
-        .collect();
-    found.sort();
-    found.pop()
 }
 
 fn download(arch: &str, dest: &Path) -> Result<(), String> {
@@ -57,7 +48,7 @@ fn download(arch: &str, dest: &Path) -> Result<(), String> {
         .into_iter()
         .flatten()
         .filter(|package| package["id"].as_str().map(str::to_ascii_lowercase).is_some_and(|id| id.starts_with("microsoft.vc.") && id.ends_with(&suffix)))
-        .max_by_key(|package| version(package["version"].as_str().unwrap_or_default()))
+        .max_by_key(|package| package["version"].as_str().unwrap_or_default().split('.').filter_map(|part| part.parse().ok()).collect::<Vec<u32>>())
         .ok_or_else(|| format!("the Visual Studio manifest has no {arch} CRT redist package"))?;
     let release = package["version"].as_str().unwrap_or_default();
     let payload = &package["payloads"][0];
@@ -67,8 +58,7 @@ fn download(arch: &str, dest: &Path) -> Result<(), String> {
 
     log("bundle", CYAN, &format!("windows-portable: downloading MSVC runtime {release} ({arch})"));
     let vsix = fetch(url)?;
-    let digest: String = Sha256::digest(&vsix).iter().map(|byte| format!("{byte:02x}")).collect();
-    if !digest.eq_ignore_ascii_case(sha256) {
+    if !hex(&Sha256::digest(&vsix)).eq_ignore_ascii_case(sha256) {
         return Err(format!("the CRT redist package from {url} does not match its sha256"));
     }
 
@@ -78,8 +68,7 @@ fn download(arch: &str, dest: &Path) -> Result<(), String> {
     }
     reset_dir(dest)?;
     for (name, contents) in &dlls {
-        let file = dest.join(name.rsplit('/').next().unwrap_or(name));
-        std::fs::write(&file, contents).map_err(|e| format!("{}: {e}", file.display()))?;
+        write(&dest.join(name.rsplit('/').next().unwrap_or(name)), contents)?;
     }
     write(&dest.join(".version"), release)
 }
@@ -94,8 +83,6 @@ fn is_release_crt(name: &str, arch: &str) -> bool {
         && file.to_ascii_lowercase().ends_with(".dll")
 }
 
-fn version(text: &str) -> Vec<u32> { text.split('.').filter_map(|part| part.parse().ok()).collect() }
-
 fn json(url: &str) -> Result<Value, String> { serde_json::from_slice(&fetch(url)?).map_err(|e| format!("{url}: {e}")) }
 
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
@@ -107,17 +94,6 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
         return Err(format!("curl {url} failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
     }
     Ok(output.stdout)
-}
-
-fn cache_root() -> Result<PathBuf, String> {
-    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from).ok_or_else(|| format!("{name} is not set"));
-    if cfg!(windows) {
-        var("LOCALAPPDATA")
-    } else if cfg!(target_os = "macos") {
-        var("HOME").map(|home| home.join("Library/Caches"))
-    } else {
-        var("XDG_CACHE_HOME").or_else(|_| var("HOME").map(|home| home.join(".cache")))
-    }
 }
 
 fn unzip(bytes: &[u8], wanted: impl Fn(&str) -> bool) -> Option<Vec<(String, Vec<u8>)>> {

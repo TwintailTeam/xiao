@@ -65,7 +65,6 @@ impl Clipboard {
         }
     }
 
-    /// Writes the image file at `path`.
     pub fn write_image_file(&self, path: impl AsRef<Path>) -> Result<(), String> {
         let path = path.as_ref();
         crate::app::trace!("[clipboard] write image {}", path.display());

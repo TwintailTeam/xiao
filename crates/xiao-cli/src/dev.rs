@@ -1,4 +1,4 @@
-use crate::conf::{CONFIG_FILE, Conf};
+use crate::conf::Conf;
 use crate::util::*;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -9,10 +9,12 @@ const POLL: Duration = Duration::from_millis(400);
 const RESTART_EXIT_CODE: i32 = 75;
 
 pub fn run(conf: &Conf) -> Result<(), String> {
-    let dev_url = conf.dev_url();
-    let mut watch = vec![conf.app.clone()];
-    watch.extend(conf.strings_at(&["build", "additionalWatchFolders"]).iter().map(|dir| conf.root.join(dir)));
-    watch.extend(conf.strings_at(&["bundle", "resources"]).iter().map(|entry| conf.asset(entry)));
+    let dev_url = std::env::var("XIAO_DEV_URL").unwrap_or_else(|_| conf.str_at(&["build", "devUrl"]).unwrap_or("http://localhost:1420").to_owned());
+    let mut watch = conf.files.clone();
+    watch.push(conf.app.clone());
+    for key in [["build", "additionalWatchFolders"], ["bundle", "resources"]] {
+        watch.extend(conf.strings_at(&key).iter().map(|entry| conf.root.join(entry)));
+    }
 
     log("dev", GREEN, &format!("{} dev", conf.product_name()));
 
@@ -32,7 +34,7 @@ pub fn run(conf: &Conf) -> Result<(), String> {
     let listed: Vec<String> = watch.iter().map(|dir| dir.strip_prefix(&conf.root).unwrap_or(dir).display().to_string()).collect();
     log("dev", GREEN, &format!("watching {}", listed.join(", ")));
 
-    let mut fingerprint = snapshot(conf, &watch);
+    let mut fingerprint = snapshot(&watch);
     loop {
         std::thread::sleep(POLL);
 
@@ -58,7 +60,7 @@ pub fn run(conf: &Conf) -> Result<(), String> {
             return Err("dev server exited".to_owned());
         }
 
-        let current = snapshot(conf, &watch);
+        let current = snapshot(&watch);
         if current == fingerprint {
             continue;
         }
@@ -89,7 +91,14 @@ fn start_frontend(conf: &Conf, dev_url: &str) -> Result<Option<Child>, String> {
 
     log("vite", MAGENTA, &format!("starting: {command}"));
     let (shell, first) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-    let mut child = spawn_piped(shell, &[first, command], &conf.root).map_err(|e| format!("cannot start beforeDevCommand: {e}"))?;
+    let mut child = std::process::Command::new(shell)
+        .args([first, command])
+        .current_dir(&conf.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start beforeDevCommand: {e}"))?;
+    track(&child);
     pipe(&mut child, "vite", MAGENTA);
     Ok(Some(child))
 }
@@ -125,8 +134,7 @@ fn build(conf: &Conf) -> Result<bool, String> {
     log("cargo", CYAN, "building…");
     let started = Instant::now();
 
-    let status =
-        std::process::Command::new("cargo").args(["build"]).current_dir(&conf.app).envs(crate::qt::cargo_env()?).status().map_err(|e| format!("cargo: {e}"))?;
+    let status = conf.cargo()?.arg("build").status().map_err(|e| format!("cargo: {e}"))?;
 
     if status.success() {
         stage_resources(conf, &conf.target_dir().join("debug"))?;
@@ -136,7 +144,7 @@ fn build(conf: &Conf) -> Result<bool, String> {
 }
 
 fn start_app(conf: &Conf, dev_url: &str) -> Option<Child> {
-    let bin = conf.target_dir().join("debug").join(exe_name(conf.binary_name()));
+    let bin = conf.target_dir().join("debug").join(format!("{}{}", conf.binary_name(), std::env::consts::EXE_SUFFIX));
 
     if !bin.is_file() {
         log("app", RED, &format!("binary not found: {}", bin.display()));
@@ -182,10 +190,8 @@ fn stop(child: &mut Option<Child>) {
     *child = None;
 }
 
-fn exe_name(name: &str) -> String { if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() } }
-
-fn snapshot(conf: &Conf, watch: &[std::path::PathBuf]) -> Option<SystemTime> {
-    let mut newest = conf.root.join(CONFIG_FILE).metadata().and_then(|m| m.modified()).ok();
+fn snapshot(watch: &[std::path::PathBuf]) -> Option<SystemTime> {
+    let mut newest = None;
 
     for dir in watch {
         walk(dir, &mut |path| {

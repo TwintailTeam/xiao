@@ -1,3 +1,4 @@
+use crate::util::hex;
 use md5::Digest as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -42,20 +43,13 @@ enum Value {
     Bin(Vec<u8>),
 }
 
-struct Entry {
-    tag: u32,
-    value: Value,
-}
-
-fn entry(tag: u32, value: Value) -> Entry { Entry { tag, value } }
-
-fn header(region: u32, mut entries: Vec<Entry>) -> Vec<u8> {
-    entries.sort_by_key(|e| e.tag);
+fn header(region: u32, mut entries: Vec<(u32, Value)>) -> Vec<u8> {
+    entries.sort_by_key(|(tag, _)| *tag);
 
     let mut store: Vec<u8> = Vec::new();
     let mut index: Vec<[u32; 4]> = Vec::new();
 
-    for Entry { tag, value } in &entries {
+    for (tag, value) in &entries {
         let align = match value {
             Value::Int16(_) => 2,
             Value::Int32(_) => 4,
@@ -172,16 +166,12 @@ fn cpio_entry(out: &mut Vec<u8>, name: &str, mode: u32, size: u32, mtime: u32, i
     }
 }
 
-fn owns_dir(installed: &str, identifier: &str) -> bool {
-    let own = format!("/usr/lib/{identifier}");
-    installed == own || installed.starts_with(&format!("{own}/"))
-}
-
 fn collect(stage: &Path, identifier: &str) -> Result<Payload, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
     walk(stage, &mut paths);
     paths.sort();
 
+    let owned = ["/usr/lib", "/usr/libexec"].map(|parent| format!("{parent}/{identifier}"));
     let mut cpio = Vec::new();
     let mut files = Vec::new();
     let mut total_size = 0u64;
@@ -190,7 +180,7 @@ fn collect(stage: &Path, identifier: &str) -> Result<Payload, String> {
         let meta = path.symlink_metadata().map_err(|e| format!("{}: {e}", path.display()))?;
         let relative = path.strip_prefix(stage).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
         let installed = format!("/{relative}");
-        if meta.is_dir() && !owns_dir(&installed, identifier) {
+        if meta.is_dir() && !owned.iter().any(|own| installed == *own || installed.starts_with(&format!("{own}/"))) {
             continue;
         }
         let mtime = meta.mtime() as u32;
@@ -235,8 +225,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
-
 pub fn write(stage: &Path, meta: &Metadata, dest: &Path) -> Result<(), String> {
     let payload = collect(stage, meta.identifier)?;
 
@@ -272,49 +260,49 @@ pub fn write(stage: &Path, meta: &Metadata, dest: &Path) -> Result<(), String> {
     }
 
     let entries = vec![
-        entry(100, Value::StrArray(vec!["C".to_owned()])), // HEADERI18NTABLE
-        entry(1000, Value::Str(meta.name.to_owned())),
-        entry(1001, Value::Str(meta.version.to_owned())),
-        entry(1002, Value::Str(meta.release.to_owned())),
-        entry(1003, Value::Int32(vec![meta.epoch])),
-        entry(1004, Value::I18n(meta.summary.to_owned())),
-        entry(1005, Value::I18n(meta.description.to_owned())),
-        entry(1006, Value::Int32(vec![now()])),
-        entry(1009, Value::Int32(vec![payload.total_size as u32])),
-        entry(1014, Value::Str(meta.license.to_owned())),
-        entry(1011, Value::Str(meta.vendor.to_owned())),
-        entry(1016, Value::I18n(meta.group.to_owned())),
-        entry(1020, Value::Str(meta.url.to_owned())),
-        entry(1021, Value::Str("linux".to_owned())),
-        entry(1022, Value::Str(meta.arch.to_owned())),
-        entry(1028, Value::Int32(payload.files.iter().map(|f| f.size).collect())),
-        entry(1030, Value::Int16(payload.files.iter().map(|f| f.mode).collect())),
-        entry(1033, Value::Int16(vec![0; count])), // FILERDEVS
-        entry(1034, Value::Int32(payload.files.iter().map(|f| f.mtime).collect())),
-        entry(1035, Value::StrArray(payload.files.iter().map(|f| f.digest.clone()).collect())),
-        entry(1036, Value::StrArray(payload.files.iter().map(|f| f.link_to.clone()).collect())),
-        entry(1037, Value::Int32(vec![0; count])), // FILEFLAGS
-        entry(1039, Value::StrArray(vec!["root".to_owned(); count])),
-        entry(1040, Value::StrArray(vec!["root".to_owned(); count])),
-        entry(1044, Value::Str(format!("{}-{}-{}.src.rpm", meta.name, meta.version, meta.release))),
-        entry(1045, Value::Int32(vec![u32::MAX; count])), // FILEVERIFYFLAGS
-        entry(1046, Value::Int32(vec![payload.cpio.len() as u32])),
-        entry(1047, Value::StrArray(vec![meta.name.to_owned()])), // PROVIDENAME
-        entry(1048, Value::Int32(require_flags)),
-        entry(1049, Value::StrArray(require_names)),
-        entry(1050, Value::StrArray(require_versions)),
-        entry(1094, Value::Int32(vec![SENSE_EQUAL])),             // PROVIDEFLAGS
-        entry(1095, Value::Int32(vec![1; count])),                // FILEDEVICES
-        entry(1096, Value::Int32((1..=count as u32).collect())),  // FILEINODES
-        entry(1097, Value::StrArray(vec![String::new(); count])), // FILELANGS
-        entry(1113, Value::StrArray(vec![evr.clone()])),          // PROVIDEVERSION
-        entry(1116, Value::Int32(dir_indexes)),
-        entry(1117, Value::StrArray(basenames)),
-        entry(1118, Value::StrArray(dirs)),
-        entry(1124, Value::Str("cpio".to_owned())),
-        entry(1125, Value::Str("gzip".to_owned())),
-        entry(1126, Value::Str("9".to_owned())),
-        entry(5011, Value::Int32(vec![FILEDIGEST_SHA256])),
+        (100, Value::StrArray(vec!["C".to_owned()])),
+        (1000, Value::Str(meta.name.to_owned())),
+        (1001, Value::Str(meta.version.to_owned())),
+        (1002, Value::Str(meta.release.to_owned())),
+        (1003, Value::Int32(vec![meta.epoch])),
+        (1004, Value::I18n(meta.summary.to_owned())),
+        (1005, Value::I18n(meta.description.to_owned())),
+        (1006, Value::Int32(vec![std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as u32)])),
+        (1009, Value::Int32(vec![payload.total_size as u32])),
+        (1014, Value::Str(meta.license.to_owned())),
+        (1011, Value::Str(meta.vendor.to_owned())),
+        (1016, Value::I18n(meta.group.to_owned())),
+        (1020, Value::Str(meta.url.to_owned())),
+        (1021, Value::Str("linux".to_owned())),
+        (1022, Value::Str(meta.arch.to_owned())),
+        (1028, Value::Int32(payload.files.iter().map(|f| f.size).collect())),
+        (1030, Value::Int16(payload.files.iter().map(|f| f.mode).collect())),
+        (1033, Value::Int16(vec![0; count])),
+        (1034, Value::Int32(payload.files.iter().map(|f| f.mtime).collect())),
+        (1035, Value::StrArray(payload.files.iter().map(|f| f.digest.clone()).collect())),
+        (1036, Value::StrArray(payload.files.iter().map(|f| f.link_to.clone()).collect())),
+        (1037, Value::Int32(vec![0; count])),
+        (1039, Value::StrArray(vec!["root".to_owned(); count])),
+        (1040, Value::StrArray(vec!["root".to_owned(); count])),
+        (1044, Value::Str(format!("{}-{}-{}.src.rpm", meta.name, meta.version, meta.release))),
+        (1045, Value::Int32(vec![u32::MAX; count])),
+        (1046, Value::Int32(vec![payload.cpio.len() as u32])),
+        (1047, Value::StrArray(vec![meta.name.to_owned()])),
+        (1048, Value::Int32(require_flags)),
+        (1049, Value::StrArray(require_names)),
+        (1050, Value::StrArray(require_versions)),
+        (1094, Value::Int32(vec![SENSE_EQUAL])),
+        (1095, Value::Int32(vec![1; count])),
+        (1096, Value::Int32((1..=count as u32).collect())),
+        (1097, Value::StrArray(vec![String::new(); count])),
+        (1113, Value::StrArray(vec![evr.clone()])),
+        (1116, Value::Int32(dir_indexes)),
+        (1117, Value::StrArray(basenames)),
+        (1118, Value::StrArray(dirs)),
+        (1124, Value::Str("cpio".to_owned())),
+        (1125, Value::Str("gzip".to_owned())),
+        (1126, Value::Str("9".to_owned())),
+        (5011, Value::Int32(vec![FILEDIGEST_SHA256])),
     ];
 
     let header_bytes = header(REGION_IMMUTABLE, entries);
@@ -328,10 +316,10 @@ pub fn write(stage: &Path, meta: &Metadata, dest: &Path) -> Result<(), String> {
     signed.extend_from_slice(&compressed);
 
     let signature = header(REGION_SIGNATURES, vec![
-        entry(1000, Value::Int32(vec![signed.len() as u32])),
-        entry(1004, Value::Bin(md5::Md5::digest(&signed).to_vec())),
-        entry(1007, Value::Int32(vec![payload.cpio.len() as u32])),
-        entry(273, Value::Str(hex(&sha2::Sha256::digest(&header_bytes)))),
+        (1000, Value::Int32(vec![signed.len() as u32])),
+        (1004, Value::Bin(md5::Md5::digest(&signed).to_vec())),
+        (1007, Value::Int32(vec![payload.cpio.len() as u32])),
+        (273, Value::Str(hex(&sha2::Sha256::digest(&header_bytes)))),
     ]);
 
     let mut out = lead(meta);
@@ -341,10 +329,5 @@ pub fn write(stage: &Path, meta: &Metadata, dest: &Path) -> Result<(), String> {
     }
     out.extend_from_slice(&signed);
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(dest, out).map_err(|e| format!("writing {}: {e}", dest.display()))
+    crate::util::write(dest, out)
 }
-
-fn now() -> u32 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0) }

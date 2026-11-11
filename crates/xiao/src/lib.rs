@@ -52,7 +52,7 @@ mod ffi {
         pub fn init_web_engine();
         pub fn install_repaint_guard();
         pub fn set_relaunch_command(app_id: *const c_char, display_name: *const c_char);
-        pub fn set_app_identity(name: *const c_char, organization: *const c_char);
+        pub fn set_app_identity(name: *const c_char, organization: *const c_char, desktop_file: *const c_char);
         pub fn set_window_icon(path: *const c_char);
         pub fn resource_exists(path: *const c_char) -> bool;
         pub fn open_url(url: *const c_char) -> bool;
@@ -195,7 +195,11 @@ impl Shell {
         close_remote_debugging();
         match_compositor_gpu();
 
-        with_c_str(config::product_name(), |name| with_c_str(config::identifier(), |organization| unsafe { ffi::set_app_identity(name, organization) }));
+        with_c_str(config::product_name(), |name| {
+            with_c_str(config::identifier(), |organization| {
+                with_c_str(config::binary_name(), |desktop_file| unsafe { ffi::set_app_identity(name, organization, desktop_file) })
+            })
+        });
         if let Some(logger) = self.logger.take()
             && let Err(e) = logger.install()
         {
@@ -207,7 +211,7 @@ impl Shell {
         if let Some(handler) = self.single_instance.take().filter(|_| config::single_instance_enabled()) {
             match single_instance::acquire(&identifier) {
                 single_instance::Role::Secondary => {
-                    println!("[single-instance] already running, handed over and exiting");
+                    app::trace!("[single-instance] already running, handed over and exiting");
                     return;
                 }
                 single_instance::Role::Primary(lock) => instance = lock.map(|lock| (lock, handler)),
@@ -436,7 +440,7 @@ struct Application(*mut c_void);
 
 impl Application {
     fn new() -> Self {
-        let args: Vec<CString> = std::env::args_os().map(|arg| c_arg(&arg)).collect();
+        let args: Vec<CString> = std::env::args_os().take(1).map(|arg| c_arg(&arg)).collect();
         let argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
         Self(unsafe { ffi::application_new(argv.as_ptr(), argv.len() as i32) })
     }

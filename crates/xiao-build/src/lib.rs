@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-/// Windows-only build settings.
 #[derive(Default, Clone)]
 pub struct WindowsAttributes {
     app_manifest: Option<String>,
@@ -29,10 +28,10 @@ impl WindowsAttributes {
 
 /// The config file name. It is searched for upward from the crate's directory.
 pub const CONFIG_FILE: &str = "xiao.conf.json";
+const CONFIG_ENV: &str = "XIAO_CONFIG";
 const QML_DIR: &str = "qml";
 const RESOURCE_PREFIX: &str = "/xiao";
 
-/// Settings for [`try_build`].
 pub struct Attributes {
     windows: WindowsAttributes,
     qml_module: Option<String>,
@@ -47,7 +46,6 @@ impl Attributes {
     /// The defaults: QML module named after `identifier`, entry `main.qml`.
     pub fn new() -> Self { Self::default() }
 
-    /// Manifest and icon for Windows builds.
     pub fn windows_attributes(mut self, windows: WindowsAttributes) -> Self {
         self.windows = windows;
         self
@@ -66,18 +64,6 @@ impl Attributes {
     }
 }
 
-fn find_config(manifest_dir: &Path) -> Option<PathBuf> {
-    let mut dir = Some(manifest_dir);
-    while let Some(current) = dir {
-        let candidate = current.join(CONFIG_FILE);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = current.parent();
-    }
-    None
-}
-
 /// [`try_build`] with default [`Attributes`]. Panics on error.
 pub fn build() { try_build(Attributes::new()).unwrap_or_else(|e| panic!("xiao-build failed: {e}")); }
 
@@ -86,16 +72,33 @@ pub fn build() { try_build(Attributes::new()).unwrap_or_else(|e| panic!("xiao-bu
 /// `OUT_DIR` with `CONFIG_JSON` and `QML_ENTRY`. On Windows it also embeds
 /// the manifest and icon.
 ///
+/// `xiao.<os>.conf.json` next to the config (`linux`, `windows`, `macos`) and
+/// then the `XIAO_CONFIG` variable are merged over it as JSON Merge Patches.
+///
 /// A release build fails if `build.frontendDist` has no `index.html`.
 pub fn try_build(attrs: Attributes) -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    let config_path = find_config(&manifest_dir).ok_or_else(|| format!("cannot find {CONFIG_FILE} in {} or any parent directory", manifest_dir.display()))?;
+    let config_path = manifest_dir
+        .ancestors()
+        .map(|dir| dir.join(CONFIG_FILE))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("cannot find {CONFIG_FILE} in {} or any parent directory", manifest_dir.display()))?;
 
-    println!("cargo:rerun-if-changed={}", config_path.display());
+    let mut config = read_json(&config_path)?;
 
-    let raw = std::fs::read_to_string(&config_path).map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", config_path.display()))?;
+    let platform = config_path.with_file_name(format!("xiao.{}.conf.json", std::env::var("CARGO_CFG_TARGET_OS")?));
+    if platform.is_file() {
+        merge(&mut config, read_json(&platform)?);
+    }
+
+    println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
+    if let Ok(extra) = std::env::var(CONFIG_ENV) {
+        match serde_json::from_str(&extra).map_err(|e| format!("{CONFIG_ENV} is not valid JSON: {e}"))? {
+            serde_json::Value::Array(patches) => patches.into_iter().for_each(|patch| merge(&mut config, patch)),
+            patch => merge(&mut config, patch),
+        }
+    }
 
     for required in ["productName", "version", "identifier"] {
         let ok = config.get(required).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
@@ -104,15 +107,145 @@ pub fn try_build(attrs: Attributes) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let mut unknown = Vec::new();
+    unknown_keys(&config, "", &mut unknown);
+    for key in unknown {
+        println!("cargo:warning={CONFIG_FILE}: `{key}` is not a key xiao reads, check its spelling");
+    }
+
     let module_uri =
         attrs.qml_module.clone().or_else(|| config["identifier"].as_str().map(qml_uri)).ok_or("`identifier` is required to name the app's QML module")?;
     select_linker();
-    link_bundle_rpath();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/../Frameworks");
+    }
     write_config(&out_dir, &config, &module_uri, &attrs.qml_entry)?;
     embed_windows_manifest(&config_path, &config, &attrs.windows)?;
     embed_windows_icon(&config_path, &config, &attrs.windows)?;
     build_qml_module(&manifest_dir, &module_uri, embedded_assets(&config_path, &config)?)?;
     Ok(())
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    println!("cargo:rerun-if-changed={}", path.display());
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?)
+}
+
+fn merge(base: &mut serde_json::Value, patch: serde_json::Value) {
+    let serde_json::Value::Object(entries) = patch else {
+        *base = patch;
+        return;
+    };
+    if !base.is_object() {
+        *base = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let serde_json::Value::Object(target) = base else { return };
+    for (key, value) in entries {
+        if value.is_null() {
+            target.remove(&key);
+        } else {
+            merge(target.entry(key).or_insert(serde_json::Value::Null), value);
+        }
+    }
+}
+
+const KNOWN_KEYS: &[&str] = &[
+    "$schema",
+    "productName",
+    "mainBinaryName",
+    "version",
+    "identifier",
+    "build.appDir",
+    "build.beforeDevCommand",
+    "build.devUrl",
+    "build.beforeBuildCommand",
+    "build.beforeBundleCommand",
+    "build.frontendDist",
+    "build.additionalWatchFolders",
+    "app.singleInstance",
+    "app.webEngine.matchGpu",
+    "app.deepLink.schemes",
+    "app.trayIcon.iconPath",
+    "app.trayIcon.tooltip",
+    "app.windows[].title",
+    "app.windows[].width",
+    "app.windows[].height",
+    "app.windows[].minWidth",
+    "app.windows[].minHeight",
+    "app.windows[].maxWidth",
+    "app.windows[].maxHeight",
+    "app.windows[].x",
+    "app.windows[].y",
+    "app.windows[].resizable",
+    "app.windows[].decorations",
+    "app.windows[].alwaysOnTop",
+    "app.windows[].center",
+    "app.windows[].fullscreen",
+    "app.windows[].maximized",
+    "app.windows[].visible",
+    "app.windows[].backgroundColor",
+    "app.windows[].whenHidden",
+    "app.security.page.readClipboard",
+    "app.security.page.writeClipboard",
+    "app.security.page.fileDialogs",
+    "app.security.page.createDirectories",
+    "app.security.page.registerDeepLinks",
+    "app.security.page.downloads",
+    "app.security.opener.schemes",
+    "app.security.opener.paths",
+    "app.security.csp",
+    "app.security.devCsp",
+    "bundle.targets",
+    "bundle.icon",
+    "bundle.resources",
+    "bundle.webengineLocales",
+    "bundle.category",
+    "bundle.shortDescription",
+    "bundle.longDescription",
+    "bundle.publisher",
+    "bundle.homepage",
+    "bundle.license",
+    "bundle.linux.desktop.categories",
+    "bundle.linux.desktop.genericName",
+    "bundle.linux.desktop.keywords",
+    "bundle.linux.deb.section",
+    "bundle.linux.deb.priority",
+    "bundle.linux.deb.maintainer",
+    "bundle.linux.deb.depends",
+    "bundle.linux.rpm.release",
+    "bundle.linux.rpm.epoch",
+    "bundle.linux.rpm.depends",
+    "bundle.macOS.minimumSystemVersion",
+    "bundle.macOS.category",
+    "bundle.windows.appManifest",
+    "bundle.windows.appManifestPath",
+];
+
+const FREE_FORM_KEYS: &[&str] = &["app.security.csp", "app.security.devCsp"];
+
+fn unknown_keys(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, child) in entries {
+                let here = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                let known = KNOWN_KEYS
+                    .iter()
+                    .any(|known| known.strip_prefix(here.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('.') || rest.starts_with("[]")));
+                if !known {
+                    found.push(here);
+                } else if !FREE_FORM_KEYS.contains(&here.as_str()) {
+                    unknown_keys(child, &here, found);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                unknown_keys(item, &format!("{path}[]"), found);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn embedded_assets(config_path: &Path, config: &serde_json::Value) -> Result<cxx_qt_build::QResources, Box<dyn Error>> {
@@ -123,6 +256,7 @@ fn embedded_assets(config_path: &Path, config: &serde_json::Value) -> Result<cxx
     let frontend = root.join(config["build"]["frontendDist"].as_str().unwrap_or("dist"));
     let mut files = Vec::new();
     if frontend.is_dir() {
+        println!("cargo:rerun-if-changed={}", frontend.display());
         collect_files(&frontend, &frontend, &mut files);
     }
     if !files.iter().any(|(_, relative)| relative == "index.html") {
@@ -137,7 +271,12 @@ fn embedded_assets(config_path: &Path, config: &serde_json::Value) -> Result<cxx
         resource = resource.file(qt_build_utils::QResourceFile::new(path).alias(format!("dist/{relative}")));
     }
 
-    let mut icons: Vec<String> = icon_paths(config).into_iter().filter(|icon| icon.ends_with(".png")).collect();
+    let listed: Vec<String> = match &config["bundle"]["icon"] {
+        serde_json::Value::Array(items) => items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
+        serde_json::Value::String(one) => vec![one.clone()],
+        _ => Vec::new(),
+    };
+    let mut icons: Vec<String> = listed.into_iter().filter(|icon| icon.ends_with(".png")).collect();
     if let Some(tray) = config["app"]["trayIcon"]["iconPath"].as_str().filter(|icon| !icon.is_empty()) {
         icons.push(tray.to_owned());
     }
@@ -182,14 +321,6 @@ fn collect_files(base: &Path, dir: &Path, found: &mut Vec<(PathBuf, String)>) {
     found.sort();
 }
 
-fn icon_paths(config: &serde_json::Value) -> Vec<String> {
-    match &config["bundle"]["icon"] {
-        serde_json::Value::Array(items) => items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
-        serde_json::Value::String(one) => vec![one.clone()],
-        _ => Vec::new(),
-    }
-}
-
 fn build_qml_module(manifest_dir: &Path, module_uri: &str, assets: cxx_qt_build::QResources) -> Result<(), Box<dyn Error>> {
     let qml_dir = manifest_dir.join(QML_DIR);
     if !qml_dir.is_dir() {
@@ -208,6 +339,7 @@ fn build_qml_module(manifest_dir: &Path, module_uri: &str, assets: cxx_qt_build:
         return Err(format!("{} contains no .qml files", qml_dir.display()).into());
     }
 
+    println!("cargo:rerun-if-changed={QML_DIR}");
     let mut module = cxx_qt_build::QmlModule::new(module_uri);
     for file in &files {
         println!("cargo:rerun-if-changed={file}");
@@ -238,13 +370,12 @@ fn select_linker() {
         Err(_) => vec!["mold".to_owned(), "lld".to_owned()],
     };
 
-    match candidates.into_iter().find(|name| on_path(name)) {
+    let on_path = |program: &String| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()));
+    match candidates.into_iter().find(on_path) {
         Some(linker) => println!("cargo:rustc-link-arg=-fuse-ld={linker}"),
         None => println!("cargo:warning=neither mold nor lld found: linking may fail with GNU ld (install one, or set XIAO_LINKER)"),
     }
 }
-
-fn on_path(program: &str) -> bool { std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file())) }
 
 fn write_config(out_dir: &Path, config: &serde_json::Value, module_uri: &str, qml_entry: &str) -> Result<(), Box<dyn Error>> {
     let compact = serde_json::to_string(config)?;
@@ -264,53 +395,6 @@ fn write_config(out_dir: &Path, config: &serde_json::Value, module_uri: &str, qm
         ),
     )
     .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
-    Ok(())
-}
-
-fn embed_manifest(xml: &str) -> Result<(), Box<dyn Error>> {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return Ok(());
-    }
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    let path = out_dir.join("app.manifest");
-    std::fs::write(&path, xml).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", path.display());
-    } else {
-        println!(
-            "cargo:warning=app manifest written to {} but not embedded: only the MSVC toolchain is supported (use x86_64-pc-windows-msvc)",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn embed_icon(ico: &Path) -> Result<(), Box<dyn Error>> {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return Ok(());
-    }
-    if !ico.is_file() {
-        println!("cargo:warning=icon {} not found: the exe will use the default icon", ico.display());
-        return Ok(());
-    }
-    println!("cargo:rerun-if-changed={}", ico.display());
-
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
-        println!("cargo:warning=icon {} not embedded: only the MSVC toolchain is supported (use x86_64-pc-windows-msvc)", ico.display());
-        return Ok(());
-    }
-
-    let ico_bytes = std::fs::read(ico).map_err(|e| format!("cannot read {}: {e}", ico.display()))?;
-    let res = icon_res(&ico_bytes).map_err(|e| format!("{}: {e}", ico.display()))?;
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    let res_path = out_dir.join("icon.res");
-    std::fs::write(&res_path, res).map_err(|e| format!("cannot write {}: {e}", res_path.display()))?;
-    println!("cargo:rustc-link-arg-bins={}", res_path.display());
     Ok(())
 }
 
@@ -372,12 +456,6 @@ fn res_entry(res: &mut Vec<u8>, kind: u16, name: u16, flags: u16, data: &[u8]) {
     }
 }
 
-fn link_bundle_rpath() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/../Frameworks");
-    }
-}
-
 fn embed_windows_manifest(config_path: &Path, config: &serde_json::Value, windows: &WindowsAttributes) -> Result<(), Box<dyn Error>> {
     let win_cfg = &config["bundle"]["windows"];
 
@@ -397,7 +475,25 @@ fn embed_windows_manifest(config_path: &Path, config: &serde_json::Value, window
         },
     };
 
-    embed_manifest(manifest.as_deref().unwrap_or(DEFAULT_MANIFEST))
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return Ok(());
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let path = out_dir.join("app.manifest");
+    std::fs::write(&path, manifest.as_deref().unwrap_or(DEFAULT_MANIFEST)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
+        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", path.display());
+    } else {
+        println!(
+            "cargo:warning=app manifest written to {} but not embedded: only the MSVC toolchain is supported (use x86_64-pc-windows-msvc)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 const DEFAULT_MANIFEST: &str = r#"
@@ -447,6 +543,24 @@ fn embed_windows_icon(config_path: &Path, config: &serde_json::Value, windows: &
         return Ok(());
     };
 
-    let base = config_path.parent().unwrap_or(Path::new("."));
-    embed_icon(&base.join(&relative))
+    let ico = config_path.parent().unwrap_or(Path::new(".")).join(&relative);
+    if !ico.is_file() {
+        println!("cargo:warning=icon {} not found: the exe will use the default icon", ico.display());
+        return Ok(());
+    }
+    println!("cargo:rerun-if-changed={}", ico.display());
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        println!("cargo:warning=icon {} not embedded: only the MSVC toolchain is supported (use x86_64-pc-windows-msvc)", ico.display());
+        return Ok(());
+    }
+
+    let ico_bytes = std::fs::read(&ico).map_err(|e| format!("cannot read {}: {e}", ico.display()))?;
+    let res = icon_res(&ico_bytes).map_err(|e| format!("{}: {e}", ico.display()))?;
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let res_path = out_dir.join("icon.res");
+    std::fs::write(&res_path, res).map_err(|e| format!("cannot write {}: {e}", res_path.display()))?;
+    println!("cargo:rustc-link-arg-bins={}", res_path.display());
+    Ok(())
 }

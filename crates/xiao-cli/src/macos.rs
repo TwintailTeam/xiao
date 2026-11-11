@@ -24,10 +24,11 @@ pub fn build(conf: &Conf, out: &Path, binary: &Path) -> Result<(), String> {
     if !icns {
         log("warn", YELLOW, "macos-app: no PNG in bundle.icon: the bundle will have no icon");
     }
-    write(&contents.join("Info.plist"), &info_plist(conf, icns))?;
+    write(&contents.join("Info.plist"), info_plist(conf, icns))?;
 
     let qt = QtPaths::query()?;
     let prune = Prune::from_conf(conf);
+    qt.stage_notices(&resources.join("qt-notices"))?;
     for plugin in PLUGIN_DIRS {
         let from = qt.plugins.join(plugin);
         if from.is_dir() {
@@ -42,8 +43,9 @@ pub fn build(conf: &Conf, out: &Path, binary: &Path) -> Result<(), String> {
     }
 
     let mut roots = vec![executable];
-    collect_dylibs(&contents.join("PlugIns"), &mut roots);
-    collect_dylibs(&resources.join("qml"), &mut roots);
+    for staged in [contents.join("PlugIns"), resources.join("qml")] {
+        roots.extend(files_in(&staged).into_iter().filter(|path| path.extension().is_some_and(|ext| ext == "dylib")));
+    }
     let copied = stage_frameworks(&roots, &qt.libs, &contents.join("Frameworks"), &prune)?;
 
     log("bundle", CYAN, &format!("macos-app: {copied} frameworks and libraries, {} MiB", dir_size_kib(&app_dir) / 1024));
@@ -141,18 +143,6 @@ fn collect_helpers(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-fn collect_dylibs(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_dylibs(&path, found);
-        } else if path.extension().is_some_and(|ext| ext == "dylib") {
-            found.push(path);
-        }
-    }
-}
-
 fn info_plist(conf: &Conf, icns: bool) -> String {
     let icon_key = if icns { "  <key>CFBundleIconFile</key><string>icon.icns</string>\n" } else { "" };
 
@@ -216,9 +206,6 @@ fn build_icns(icons: &[(u32, PathBuf)], dest: &Path) -> Result<bool, String> {
     icns.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
     icns.extend_from_slice(&body);
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(dest, icns).map_err(|e| format!("{}: {e}", dest.display()))?;
+    write(dest, icns)?;
     Ok(true)
 }

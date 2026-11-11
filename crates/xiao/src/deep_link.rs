@@ -142,8 +142,6 @@ mod linux {
 
     fn key(scheme: &str) -> String { format!("x-scheme-handler/{scheme}") }
 
-    fn launcher() -> Option<PathBuf> { std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()) }
-
     fn quoted(path: &str) -> String {
         if !path
             .chars()
@@ -157,7 +155,12 @@ mod linux {
 
     pub(super) fn register(scheme: &str) -> Result<(), String> {
         let path = entry_path(scheme).ok_or("no data directory")?;
-        let launcher = launcher().ok_or("cannot tell which executable is running")?;
+        let launcher = ["APPIMAGE", "XIAO_LAUNCHER"]
+            .into_iter()
+            .find_map(|name| std::env::var_os(name).filter(|path| !path.is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .ok_or("cannot tell which executable is running")?;
 
         let entry = format!(
             "[Desktop Entry]\nType=Application\nName={}\nExec={} %u\nTerminal=false\nNoDisplay=true\nMimeType={};\n",

@@ -83,6 +83,9 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "notifyWebChannelResult"]
         fn notify_web_channel_result(self: Pin<&mut Self>, id: &QString, payload: &QString);
+        #[qinvokable]
+        #[cxx_name = "notifyDownloadEvent"]
+        fn notify_download_event(self: Pin<&mut Self>, name: &QString, payload: &QString);
     }
 
     extern "RustQt" {
@@ -128,7 +131,7 @@ pub struct BackendRust;
 #[derive(Default)]
 pub struct PageRust;
 
-const RESERVED: &[&str] = &["app://", "window://", "tray://", "dialog://", "webchannel://", "deep-link://", "log://"];
+const RESERVED: &[&str] = &["app://", "window://", "tray://", "dialog://", "webchannel://", "deep-link://", "log://", "download://"];
 
 static PAGE: OnceLock<CxxQtThread<qobject::Page>> = OnceLock::new();
 static NEXT_INVOKE: AtomicU64 = AtomicU64::new(1);
@@ -207,6 +210,8 @@ impl qobject::Backend {
 
     pub fn notify_web_channel_result(self: Pin<&mut Self>, id: &QString, payload: &QString) { self.forward("webchannel://result/", id, payload); }
 
+    pub fn notify_download_event(self: Pin<&mut Self>, name: &QString, payload: &QString) { self.forward("download://", name, payload); }
+
     fn forward(self: Pin<&mut Self>, prefix: &str, name: &QString, payload: &QString) {
         let handle = AppHandle::new(self.qt_thread());
         handle.emit_json(&format!("{prefix}{name}"), payload.to_string());
@@ -222,7 +227,7 @@ impl qobject::Page {
 
     pub fn invoke(self: Pin<&mut Self>, cmd: &QString, args: &QString) -> QString {
         let cmd = cmd.to_string();
-        let args = parse_json_object(&args.to_string());
+        let args: Value = serde_json::from_str(&args.to_string()).unwrap_or_else(|_| json!({}));
         app::trace!("[invoke] {cmd} {args}");
 
         let Some(app) = app::global_handle().cloned() else {
@@ -304,8 +309,6 @@ fn csp_source(policy: &str) -> String {
 }})();"
     )
 }
-
-fn parse_json_object(raw: &str) -> Value { serde_json::from_str(raw).unwrap_or_else(|_| json!({})) }
 
 pub(crate) fn is_dev_mode() -> bool {
     static DEV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

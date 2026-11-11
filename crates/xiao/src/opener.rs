@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const BLOCKED_SCHEMES: &[&str] = &["javascript", "data", "vbscript", "about"];
 
@@ -44,7 +44,10 @@ impl Opener {
 
     /// Opens or reveals an existing file or folder.
     pub fn open_path(&self, path: impl AsRef<Path>, mode: OpenMode) -> Result<(), String> {
-        let path = existing(path.as_ref())?;
+        let path = std::path::absolute(path.as_ref()).map_err(|e| format!("{}: {e}", path.as_ref().display()))?;
+        if !path.exists() {
+            return Err(format!("{} does not exist", path.display()));
+        }
         crate::app::trace!("[opener] {mode:?} {}", path.display());
 
         if mode == OpenMode::Reveal && !path.is_dir() {
@@ -80,12 +83,4 @@ fn check_url(url: &str) -> Result<&str, String> {
         return Err(format!("the `{scheme}` scheme cannot be opened"));
     }
     Ok(url)
-}
-
-fn existing(path: &Path) -> Result<PathBuf, String> {
-    let path = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !path.exists() {
-        return Err(format!("{} does not exist", path.display()));
-    }
-    Ok(path)
 }

@@ -1,4 +1,4 @@
-use crate::util::make_executable;
+use crate::util::{make_executable, write};
 use goblin::mach::Mach;
 use std::path::{Path, PathBuf};
 
@@ -54,9 +54,6 @@ pub fn merge(inputs: &[PathBuf], output: &Path) -> Result<(), String> {
         fat.extend_from_slice(&slice.bytes);
     }
 
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(output, fat).map_err(|e| format!("{}: {e}", output.display()))?;
+    write(output, fat)?;
     make_executable(output)
 }

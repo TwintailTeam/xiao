@@ -3,6 +3,7 @@ use crate::qt::{Prune, QML_MODULES, QtPaths, copy_qt};
 use crate::util::*;
 use backhand::compression::Compressor;
 use backhand::{FilesystemCompressor, FilesystemWriter, NodeHeader};
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -80,57 +81,86 @@ const HOST_ENV: &[&str] = &[
     "QTWEBENGINE_LOCALES_PATH",
 ];
 const OPENERS: &[&str] = &["xdg-open", "kde-open", "kde-open5", "gnome-open"];
+const RUNTIMES: &[(&str, &[u8], &str)] = &[
+    ("x86_64", include_bytes!("../runtime/type2-runtime-20251108-x86_64"), "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"),
+    ("aarch64", include_bytes!("../runtime/type2-runtime-20251108-aarch64"), "00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444"),
+];
 
-pub fn build(conf: &Conf, out: &Path, arch: &str, payload: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+pub fn build(conf: &Conf, out: &Path, arch: &str, binary: &Path) -> Result<(), String> {
     let name = conf.product_name();
+    let entry = conf.binary_name();
     let dir = out.join(format!("{name}.AppDir"));
     reset_dir(&dir)?;
 
-    let bin_dir = dir.join("usr/bin");
-    payload(&bin_dir)?;
+    let usr = dir.join("usr");
+    let copied = stage_runtime(conf, &usr, binary, arch)?;
+    stage_resources(conf, &usr.join("lib").join(conf.identifier()))?;
 
-    let qt = QtPaths::query()?;
-    stage_qt_runtime(&qt, &dir, &Prune::from_conf(conf))?;
-    stage_libraries(&qt, &dir, &bin_dir.join(conf.binary_name()), arch)?;
-
-    write(&dir.join(format!("{name}.desktop")), &crate::bundle::desktop_entry(conf))?;
+    write(&dir.join(format!("{entry}.desktop")), crate::bundle::desktop_entry(conf))?;
     let apprun = dir.join("AppRun");
-    write(&apprun, &app_run(conf.binary_name()))?;
+    write(&apprun, launcher_script("\"$(dirname \"$(readlink -f \"$0\")\")/usr\"", entry))?;
     make_executable(&apprun)?;
 
-    for opener in OPENERS {
-        let shim = dir.join("usr/shims").join(opener);
-        write(&shim, &opener_shim())?;
-        make_executable(&shim)?;
-    }
-
-    if let Some(icon) = conf.largest_png() {
-        copy_file(&icon, &dir.join(format!("{name}.png")))?;
+    if let Some((_, icon)) = conf.icon_pngs().into_iter().max_by_key(|(size, _)| *size) {
+        copy_file(&icon, &dir.join(format!("{entry}.png")))?;
         copy_file(&icon, &dir.join(".DirIcon"))?;
     }
 
-    log("bundle", CYAN, &format!("appimage: AppDir is {} MiB at {}", dir_size_kib(&dir) / 1024, dir.display()));
+    log("bundle", CYAN, &format!("appimage: {copied} shared libraries, AppDir is {} MiB at {}", dir_size_kib(&dir) / 1024, dir.display()));
 
-    let runtime = crate::tool::appimage_runtime(arch)?;
-    let image = out.join(format!("{name}-{}-{arch}.AppImage", conf.version()));
-    write_image(runtime, &dir, &image)?;
-    log("ok", GREEN, &format!("appimage → {}", image.display()));
-    Ok(())
-}
+    let (_, runtime, sha256) = RUNTIMES.iter().find(|(name, ..)| *name == arch).ok_or_else(|| format!("no pinned AppImage runtime for {arch}"))?;
+    if hex(&sha2::Sha256::digest(runtime)) != *sha256 {
+        return Err(format!("the {arch} AppImage runtime built into xiao does not match its pinned checksum"));
+    }
 
-fn write_image(runtime: &[u8], dir: &Path, image: &Path) -> Result<(), String> {
     let mut fs = FilesystemWriter::default();
     fs.set_compressor(FilesystemCompressor::new(Compressor::Gzip, None).map_err(|e| format!("squashfs: {e}"))?);
     fs.set_root_mode(0o755);
     fs.set_root_uid(0);
     fs.set_root_gid(0);
-    add_tree(&mut fs, dir, Path::new(""))?;
+    add_tree(&mut fs, &dir, Path::new(""))?;
 
-    let _ = std::fs::remove_file(image);
-    let mut file = std::fs::File::create(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    let image = out.join(format!("{name}-{}-{arch}.AppImage", conf.version()));
+    let _ = std::fs::remove_file(&image);
+    let mut file = std::fs::File::create(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     file.write_all(runtime).map_err(|e| format!("writing {}: {e}", image.display()))?;
     fs.write_with_offset(&mut file, runtime.len() as u64).map_err(|e| format!("writing the squashfs into {}: {e}", image.display()))?;
-    make_executable(image)
+    make_executable(&image)?;
+
+    log("ok", GREEN, &format!("appimage → {}", image.display()));
+    Ok(())
+}
+
+pub fn stage_runtime(conf: &Conf, usr: &Path, binary: &Path, arch: &str) -> Result<usize, String> {
+    let staged = usr.join("bin").join(conf.binary_name());
+    copy_file(binary, &staged)?;
+    make_executable(&staged)?;
+
+    let qt = QtPaths::query()?;
+    stage_qt_runtime(&qt, usr, &Prune::from_conf(conf))?;
+    let copied = stage_libraries(&qt, usr, &staged, arch)?;
+
+    let shim = format!(
+        r#"#!/bin/sh
+for var in {vars}; do
+    if eval "[ \"\${{XIAO_HOST_$var+set}}\" ]"; then
+        eval "export $var=\"\$XIAO_HOST_$var\""
+    else
+        unset "$var"
+    fi
+    unset "XIAO_HOST_$var"
+done
+exec "${{0##*/}}" "$@"
+"#,
+        vars = HOST_ENV.join(" ")
+    );
+    for opener in OPENERS {
+        let path = usr.join("shims").join(opener);
+        write(&path, &shim)?;
+        make_executable(&path)?;
+    }
+    qt.stage_notices(&usr.join("qt-notices"))?;
+    Ok(copied)
 }
 
 fn add_tree(fs: &mut FilesystemWriter, dir: &Path, inside: &Path) -> Result<(), String> {
@@ -159,50 +189,34 @@ fn add_tree(fs: &mut FilesystemWriter, dir: &Path, inside: &Path) -> Result<(), 
     Ok(())
 }
 
-fn app_run(binary: &str) -> String {
+pub fn launcher_script(here: &str, binary: &str) -> String {
     let vars = HOST_ENV.join(" ");
     format!(
         r#"#!/bin/sh
-HERE=$(dirname "$(readlink -f "$0")")
+HERE={here}
 for var in {vars}; do
     eval "[ \"\${{$var+set}}\" ] && export XIAO_HOST_$var=\"\$$var\""
 done
-export PATH="$HERE/usr/shims:$PATH"
-export LD_LIBRARY_PATH="$HERE/usr/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
-export QT_PLUGIN_PATH="$HERE/usr/plugins"
-export QML_IMPORT_PATH="$HERE/usr/qml"
-export QML2_IMPORT_PATH="$HERE/usr/qml"
-export QTWEBENGINEPROCESS_PATH="$HERE/usr/libexec/QtWebEngineProcess"
-export QTWEBENGINE_RESOURCES_PATH="$HERE/usr/resources"
-export QTWEBENGINE_LOCALES_PATH="$HERE/usr/translations/qtwebengine_locales"
-exec "$HERE/usr/bin/{binary}" "$@"
+export XIAO_LAUNCHER="$(readlink -f "$0")"
+export PATH="$HERE/shims:$PATH"
+export LD_LIBRARY_PATH="$HERE/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+export QT_PLUGIN_PATH="$HERE/plugins"
+export QML_IMPORT_PATH="$HERE/qml"
+export QML2_IMPORT_PATH="$HERE/qml"
+export QTWEBENGINEPROCESS_PATH="$HERE/libexec/QtWebEngineProcess"
+export QTWEBENGINE_RESOURCES_PATH="$HERE/resources"
+export QTWEBENGINE_LOCALES_PATH="$HERE/translations/qtwebengine_locales"
+exec "$HERE/bin/{binary}" "$@"
 "#
     )
 }
 
-fn opener_shim() -> String {
-    let vars = HOST_ENV.join(" ");
-    format!(
-        r#"#!/bin/sh
-for var in {vars}; do
-    if eval "[ \"\${{XIAO_HOST_$var+set}}\" ]"; then
-        eval "export $var=\"\$XIAO_HOST_$var\""
-    else
-        unset "$var"
-    fi
-    unset "XIAO_HOST_$var"
-done
-exec "${{0##*/}}" "$@"
-"#
-    )
-}
-
-fn stage_qt_runtime(qt: &QtPaths, dir: &Path, prune: &Prune) -> Result<(), String> {
+fn stage_qt_runtime(qt: &QtPaths, usr: &Path, prune: &Prune) -> Result<(), String> {
     let process = qt.libexecs.join("QtWebEngineProcess");
     if !process.is_file() {
         return Err(format!("QtWebEngineProcess not found at {} (install qt6-webengine)", process.display()));
     }
-    let staged = dir.join("usr/libexec/QtWebEngineProcess");
+    let staged = usr.join("libexec/QtWebEngineProcess");
     copy_file(&process, &staged)?;
     make_executable(&staged)?;
 
@@ -210,66 +224,46 @@ fn stage_qt_runtime(qt: &QtPaths, dir: &Path, prune: &Prune) -> Result<(), Strin
     if !resources.is_dir() {
         return Err(format!("{} not found (QtWebEngine's .pak files)", resources.display()));
     }
-    copy_qt(&resources, &dir.join("usr/resources"), false, prune)?;
+    copy_qt(&resources, &usr.join("resources"), false, prune)?;
 
     let locales = qt.translations.join("qtwebengine_locales");
     if locales.is_dir() {
-        copy_qt(&locales, &dir.join("usr/translations/qtwebengine_locales"), false, prune)?;
+        copy_qt(&locales, &usr.join("translations/qtwebengine_locales"), false, prune)?;
     }
 
     for plugin in PLUGIN_DIRS {
         let from = qt.plugins.join(plugin);
         if from.is_dir() {
-            copy_qt(&from, &dir.join("usr/plugins").join(plugin), false, prune)?;
+            copy_qt(&from, &usr.join("plugins").join(plugin), false, prune)?;
         }
     }
 
     for module in QML_MODULES {
         let from = qt.qml.join(module);
         if from.is_dir() {
-            copy_qt(&from, &dir.join("usr/qml").join(module), false, prune)?;
+            copy_qt(&from, &usr.join("qml").join(module), false, prune)?;
         }
     }
     Ok(())
 }
 
-fn stage_libraries(qt: &QtPaths, dir: &Path, binary: &Path, arch: &str) -> Result<(), String> {
-    let mut roots = vec![binary.to_path_buf(), dir.join("usr/libexec/QtWebEngineProcess")];
-    for staged in ["usr/plugins", "usr/qml"] {
-        collect_shared_objects(&dir.join(staged), &mut roots);
+fn stage_libraries(qt: &QtPaths, usr: &Path, binary: &Path, arch: &str) -> Result<usize, String> {
+    let mut roots = vec![binary.to_path_buf(), usr.join("libexec/QtWebEngineProcess")];
+    for staged in ["plugins", "qml"] {
+        roots
+            .extend(files_in(&usr.join(staged)).into_iter().filter(|path| path.extension().is_some_and(|ext| ext == "so") || file_name(path).contains(".so.")));
     }
 
     let wanted: Vec<(String, PathBuf)> = linked_libraries(&roots, &qt.libs, arch).into_iter().collect();
-
-    let lib_dir = dir.join("usr/lib");
-    std::fs::create_dir_all(&lib_dir).map_err(|e| format!("{}: {e}", lib_dir.display()))?;
-
-    let mut copied = 0;
-    for (name, lib) in &wanted {
-        copy_file(lib, &lib_dir.join(name))?;
-        copied += 1;
-    }
-
     if !wanted.iter().any(|(name, _)| name.starts_with("libQt6WebEngineCore")) {
         return Err(format!("libQt6WebEngineCore is not linked from {}", qt.libs.display()));
     }
 
-    log("bundle", CYAN, &format!("appimage: bundled {copied} shared libraries"));
-    Ok(())
-}
-
-fn collect_shared_objects(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_shared_objects(&path, found);
-        } else if path.extension().is_some_and(|ext| ext == "so") || file_name(&path).contains(".so.") {
-            found.push(path);
-        }
+    let lib_dir = usr.join("lib");
+    for (name, lib) in &wanted {
+        copy_file(lib, &lib_dir.join(name))?;
     }
+    Ok(wanted.len())
 }
 
 struct Linked {
@@ -302,7 +296,7 @@ fn linked_libraries(roots: &[PathBuf], qt_libs: &Path, arch: &str) -> BTreeMap<S
     }
 
     if !missing.is_empty() {
-        log("warn", YELLOW, &format!("appimage: {} not found, they must come from the host", missing.join(", ")));
+        log("warn", YELLOW, &format!("{} not found, they must come from the host", missing.join(", ")));
     }
     found
 }

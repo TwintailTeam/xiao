@@ -92,7 +92,8 @@ fn target_qmake(prefix: &Path) -> Result<PathBuf, String> {
     }
     script.push_str("        ;;\n    *) exit 1 ;;\nesac\n");
 
-    let path = std::env::temp_dir().join(format!("xiao-qmake-{:016x}", short_hash(&prefix)));
+    let hash = prefix.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3));
+    let path = cache_root()?.join("xiao/qmake").join(format!("{hash:016x}"));
     if std::fs::read_to_string(&path).ok().as_deref() != Some(script.as_str()) {
         write(&path, &script)?;
         make_executable(&path)?;
@@ -100,9 +101,8 @@ fn target_qmake(prefix: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn short_hash(text: &str) -> u64 { text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)) }
-
 pub struct QtPaths {
+    pub version: String,
     pub headers: PathBuf,
     pub libs: PathBuf,
     pub bins: PathBuf,
@@ -131,6 +131,7 @@ impl QtPaths {
         };
 
         Ok(Self {
+            version: find("QT_VERSION")?.display().to_string(),
             headers: find("QT_INSTALL_HEADERS")?,
             libs: find("QT_INSTALL_LIBS")?,
             bins: find("QT_INSTALL_BINS")?,
@@ -148,6 +149,24 @@ impl QtPaths {
         let header = versions.map(|version| version.path().join("QtWebEngineCore/private/qtwebenginecore-config_p.h")).find(|header| header.is_file())?;
         let text = std::fs::read_to_string(header).ok()?;
         text.lines().find_map(|line| line.strip_prefix("#define QT_FEATURE_webengine_proprietary_codecs ")).map(|value| value.trim() == "1")
+    }
+
+    pub fn stage_notices(&self, dir: &Path) -> Result<(), String> {
+        let version = &self.version;
+        let notice = format!(
+            "This application uses the Qt framework {version} (https://www.qt.io), licensed under the GNU Lesser General Public\n\
+             License version 3. LGPL-3.0.txt holds that license and GPL-3.0.txt the license it builds on.\n\
+             \n\
+             The Qt libraries ship as separate shared libraries next to the application and can be replaced with your own build\n\
+             of Qt {version}. Qt's source code: https://download.qt.io/official_releases/qt/\n\
+             \n\
+             Qt WebEngine includes Chromium and other third-party components under their own licenses:\n\
+             https://doc.qt.io/qt-6/qtwebengine-licensing.html\n\
+             Other third-party components in Qt: https://doc.qt.io/qt-6/licenses-used-in-qt.html\n"
+        );
+        write(&dir.join("NOTICE.txt"), notice)?;
+        write(&dir.join("LGPL-3.0.txt"), include_str!("../licenses/LGPL-3.0.txt"))?;
+        write(&dir.join("GPL-3.0.txt"), include_str!("../licenses/GPL-3.0.txt"))
     }
 }
 
@@ -175,7 +194,9 @@ impl Prune {
         if path.is_dir() {
             return !QML_UNUSED.contains(&name.as_ref()) && (!release_only || !name.ends_with(".dSYM"));
         }
-        if release_only && is_debug_artifact(&name, siblings) {
+        let debug_dll =
+            || name.strip_suffix("d.dll").is_some_and(|release| siblings.iter().any(|sibling| sibling.eq_ignore_ascii_case(&format!("{release}.dll"))));
+        if release_only && (name.ends_with(".pdb") || name.ends_with("_debug") || name.contains("_debug.") || name.contains(".debug.") || debug_dll()) {
             return false;
         }
         match parent.as_ref() {
@@ -211,11 +232,4 @@ pub fn copy_qt(from: &Path, to: &Path, release_only: bool, prune: &Prune) -> Res
         }
     }
     Ok(())
-}
-
-fn is_debug_artifact(name: &str, siblings: &[String]) -> bool {
-    if name.ends_with(".pdb") || name.ends_with("_debug") || name.contains("_debug.") || name.contains(".debug.") {
-        return true;
-    }
-    name.strip_suffix("d.dll").is_some_and(|release| siblings.iter().any(|sibling| sibling.eq_ignore_ascii_case(&format!("{release}.dll"))))
 }

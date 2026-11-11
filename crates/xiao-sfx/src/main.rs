@@ -42,7 +42,7 @@ fn run() -> Result<u32, String> {
     let name = format!("{}-{}", payload.version, payload.key);
     let dir = base.join(&name);
 
-    if !dir.join(MARKER).is_file() {
+    if !intact(&dir) {
         extract(&mut file, &payload, &base, &dir)?;
     }
     drop(file);
@@ -84,7 +84,12 @@ fn read_payload(file: &mut File) -> Option<Payload> {
     let version = text(file)?;
     let exe = text(file)?;
     let offset = file.stream_position().ok()?;
-    [&identifier, &version, &exe].iter().all(|part| single_component(part)).then_some(Payload { offset, len, key, identifier, version, exe })
+    let single_component = |part: &String| {
+        let mut components = Path::new(part).components();
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+    };
+    let valid = [&identifier, &version, &exe].into_iter().all(single_component);
+    valid.then_some(Payload { offset, len, key, identifier, version, exe })
 }
 
 fn array_at<const N: usize>(file: &mut File, at: u64) -> Option<[u8; N]> {
@@ -104,16 +109,11 @@ fn text(reader: &mut impl Read) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn single_component(part: &str) -> bool {
-    let mut components = Path::new(part).components();
-    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
-}
-
 fn extract(file: &mut File, payload: &Payload, base: &Path, dir: &Path) -> Result<(), String> {
     let partial = base.join(format!(".{}-{}", payload.key, std::process::id()));
     let _ = std::fs::remove_dir_all(&partial);
 
-    let unpacked = unpack(file, payload, &partial).and_then(|()| std::fs::write(partial.join(MARKER), b""));
+    let unpacked = unpack(file, payload, &partial).and_then(|files| std::fs::write(partial.join(MARKER), files.to_string()));
     if let Err(e) = unpacked {
         let _ = std::fs::remove_dir_all(&partial);
         return Err(format!("cannot unpack the app into {}: {e}", base.display()));
@@ -122,7 +122,7 @@ fn extract(file: &mut File, payload: &Payload, base: &Path, dir: &Path) -> Resul
     if std::fs::rename(&partial, dir).is_ok() {
         return Ok(());
     }
-    if dir.join(MARKER).is_file() {
+    if intact(dir) {
         let _ = std::fs::remove_dir_all(&partial);
         return Ok(());
     }
@@ -133,18 +133,30 @@ fn extract(file: &mut File, payload: &Payload, base: &Path, dir: &Path) -> Resul
     })
 }
 
-fn unpack(file: &mut File, payload: &Payload, dest: &Path) -> std::io::Result<()> {
+fn intact(dir: &Path) -> bool {
+    let unpacked = std::fs::read_to_string(dir.join(MARKER)).ok().and_then(|files| files.trim().parse::<u64>().ok());
+    unpacked.is_some_and(|files| count_files(dir) > files)
+}
+
+fn count_files(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries.flatten().map(|entry| if entry.path().is_dir() { count_files(&entry.path()) } else { 1 }).sum()
+}
+
+fn unpack(file: &mut File, payload: &Payload, dest: &Path) -> std::io::Result<u64> {
     let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "the app inside this program is damaged");
 
     file.seek(SeekFrom::Start(payload.offset))?;
     let mut stream = Inflate::new(BufReader::with_capacity(BUFFER, file.take(payload.len)));
+    let mut files = 0;
 
     loop {
         let len = usize::from(u16::from_le_bytes(array(&mut stream).ok_or_else(invalid)?));
         if len == 0 {
             let mut rest = [0; 1];
-            return if stream.read(&mut rest)? == 0 { Ok(()) } else { Err(invalid()) };
+            return if stream.read(&mut rest)? == 0 { Ok(files) } else { Err(invalid()) };
         }
+        files += 1;
         let mut relative = vec![0; len];
         stream.read_exact(&mut relative)?;
         let relative = String::from_utf8(relative).map_err(|_| invalid())?;

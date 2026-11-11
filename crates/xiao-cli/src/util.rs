@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 
 pub const RESET: &str = "\x1b[0m";
 pub const DIM: &str = "\x1b[2m";
@@ -11,11 +11,9 @@ pub const BLUE: &str = "\x1b[34m";
 pub const MAGENTA: &str = "\x1b[35m";
 pub const CYAN: &str = "\x1b[36m";
 
-fn use_color() -> bool { std::env::var_os("NO_COLOR").is_none() }
-
 pub fn log(tag: &str, color: &str, message: &str) {
     let label = format!("{tag:<6}");
-    let label = if use_color() { format!("{color}{label}{RESET}") } else { label };
+    let label = if std::env::var_os("NO_COLOR").is_none() { format!("{color}{label}{RESET}") } else { label };
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{label} {message}");
     let _ = out.flush();
@@ -34,12 +32,6 @@ pub fn pipe(child: &mut Child, tag: &'static str, color: &'static str) {
             }
         });
     }
-}
-
-pub fn spawn_piped(program: &str, args: &[&str], cwd: &Path) -> std::io::Result<Child> {
-    let child = Command::new(program).args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    track(&child);
-    Ok(child)
 }
 
 pub fn track(child: &Child) {
@@ -92,14 +84,10 @@ mod job {
     }
 }
 
-pub fn exec(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-    let status = Command::new(program).args(args).current_dir(cwd).status().map_err(|e| format!("{program}: {e}"))?;
-
-    if status.success() { Ok(()) } else { Err(format!("{program} exited with {status}")) }
-}
-
 pub fn run_shell(command: &str, cwd: &Path) -> Result<(), String> {
-    if cfg!(windows) { exec("cmd", &["/C", command], cwd) } else { exec("sh", &["-c", command], cwd) }
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let status = Command::new(shell).args([flag, command]).current_dir(cwd).status().map_err(|e| format!("{shell}: {e}"))?;
+    if status.success() { Ok(()) } else { Err(format!("{shell} exited with {status}")) }
 }
 
 pub fn kill_tree(child: &mut Child) {
@@ -157,7 +145,8 @@ fn children_of(pid: u32) -> Vec<u32> {
 #[cfg(unix)]
 fn signal(pids: &[u32], name: &str) {
     let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
-    let _ = Command::new("sh").args(["-c", &format!("kill -{name} {list} 2>/dev/null")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let null = std::process::Stdio::null;
+    let _ = Command::new("sh").args(["-c", &format!("kill -{name} {list} 2>/dev/null")]).stdout(null()).stderr(null()).status();
 }
 
 pub fn which(program: &str) -> bool {
@@ -168,13 +157,31 @@ pub fn which(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn cache_root() -> Result<std::path::PathBuf, String> {
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from).ok_or_else(|| format!("{name} is not set"));
+    if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|home| home.join("Library/Caches"))
+    } else {
+        var("XDG_CACHE_HOME").or_else(|_| var("HOME").map(|home| home.join(".cache")))
+    }
+}
+
+const CARGO_DIRS: &[&str] = &["build", "deps", "examples", "incremental", "bundle"];
+
 pub fn stage_resources(conf: &crate::conf::Conf, dest: &Path) -> Result<(), String> {
     for entry in conf.strings_at(&["bundle", "resources"]) {
-        let src = conf.asset(&entry);
+        let src = conf.root.join(&entry);
         let relative = resource_relpath(Path::new(&entry));
         if relative.as_os_str().is_empty() {
             log("warn", YELLOW, &format!("resource `{entry}` names no file or folder, skipped"));
             continue;
+        }
+        if let Some(first) = relative.components().next()
+            && CARGO_DIRS.iter().any(|dir| first.as_os_str() == *dir)
+        {
+            return Err(format!("resource `{entry}` would replace cargo's `{}` folder next to the binary: rename it", first.as_os_str().to_string_lossy()));
         }
         if !src.exists() {
             log("warn", YELLOW, &format!("resource `{entry}` does not exist, skipped"));
@@ -244,32 +251,31 @@ pub fn make_executable(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 pub fn make_executable(_path: &Path) -> Result<(), String> { Ok(()) }
 
-pub fn dir_size_kib(dir: &Path) -> u64 {
-    fn walk(dir: &Path, total: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, total);
-            } else if let Ok(meta) = entry.metadata() {
-                *total += meta.len().div_ceil(1024);
-            }
-        }
-    }
-
-    let mut total = 0;
-    walk(dir, &mut total);
-    total
+pub fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries.flatten().map(|entry| entry.path()).flat_map(|path| if path.is_dir() { files_in(&path) } else { vec![path] }).collect()
 }
+
+pub fn relative_files(dir: &Path) -> Vec<String> {
+    let mut found: Vec<String> = files_in(dir)
+        .iter()
+        .filter_map(|path| path.strip_prefix(dir).ok())
+        .map(|relative| relative.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
+        .collect();
+    found.sort();
+    found
+}
+
+pub fn dir_size_kib(dir: &Path) -> u64 { files_in(dir).iter().filter_map(|path| path.symlink_metadata().ok()).map(|meta| meta.len().div_ceil(1024)).sum() }
+
+pub fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 
 pub fn reset_dir(dir: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-pub fn write(path: &Path, contents: &str) -> Result<(), String> {
+pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }

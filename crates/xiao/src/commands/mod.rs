@@ -58,7 +58,8 @@ pub type Registry = HashMap<&'static str, Command>;
 pub fn command_handler<C: XiaoCommand + 'static>() -> (&'static str, Command) {
     let handler: Handler = Arc::new(|app, args| {
         let parsed = serde_json::from_value(args).map_err(|e| format!("invalid arguments for `{}`: {e}", C::name()))?;
-        let output = C::execute(app, parsed)?;
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| C::execute(app, parsed)))
+            .map_err(|panic| format!("command `{}` panicked: {}", C::name(), crate::app::panic_message(&panic)))??;
         serde_json::to_value(output).map_err(|e| e.to_string())
     });
     (C::name(), Command { handler, on_worker: C::ASYNC })

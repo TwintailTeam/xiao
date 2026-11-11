@@ -66,6 +66,10 @@ static const char kFrontendScheme[] = "xiao";
 
 static_assert(sizeof(QString) == 3 * sizeof(void*), "QString must be three pointers wide");
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
+#error "xiao needs Qt 6.9 or newer"
+#endif
+
 #ifdef Q_OS_LINUX
 namespace {
 
@@ -260,34 +264,40 @@ public:
             return;
         }
 
-        QByteArray body;
-        if (!shellFile(path, &body)) {
-            QFile file(m_root + path);
-            if (!file.open(QIODevice::ReadOnly)) {
-                job->fail(QWebEngineUrlRequestJob::UrlNotFound);
-                return;
-            }
-            body = file.readAll();
-        }
-
-        const QByteArray mime = QMimeDatabase().mimeTypeForFileNameAndData(path, body).name().toUtf8();
-        if (mime == QByteArrayLiteral("text/html")) {
-            body = withShellScripts(body);
-        }
-
         if (!m_csp.isEmpty()) {
             QMultiMap<QByteArray, QByteArray> headers;
             headers.insert(QByteArrayLiteral("Content-Security-Policy"), m_csp);
             job->setAdditionalResponseHeaders(headers);
         }
 
+        QByteArray body;
+        if (shellFile(path, &body)) {
+            replyWith(job, QMimeDatabase().mimeTypeForFileNameAndData(path, body).name().toUtf8(), body);
+            return;
+        }
+
+        auto* file = new QFile(m_root + path, job);
+        if (!file->open(QIODevice::ReadOnly)) {
+            job->fail(QWebEngineUrlRequestJob::UrlNotFound);
+            return;
+        }
+
+        const QByteArray mime = QMimeDatabase().mimeTypeForFileNameAndData(path, file).name().toUtf8();
+        if (mime == QByteArrayLiteral("text/html")) {
+            replyWith(job, mime, withShellScripts(file->readAll()));
+            return;
+        }
+        job->reply(mime, file);
+    }
+
+private:
+    static void replyWith(QWebEngineUrlRequestJob* job, const QByteArray& mime, const QByteArray& body) {
         auto* buffer = new QBuffer(job);
         buffer->setData(body);
         buffer->open(QIODevice::ReadOnly);
         job->reply(mime, buffer);
     }
 
-private:
     bool shellFile(const QString& path, QByteArray* body) const {
         if (path == QLatin1String("/__xiao/qwebchannel.js")) {
             QFile client(QStringLiteral(":/qtwebchannel/qwebchannel.js"));
@@ -707,10 +717,12 @@ extern "C" bool single_instance_listen(const char* name, void (*on_message)(cons
     return true;
 }
 
-extern "C" void set_app_identity(const char* name, const char* organization) {
+extern "C" void set_app_identity(const char* name, const char* organization, const char* desktop_file) {
     if (name && *name) {
         QCoreApplication::setApplicationName(QString::fromUtf8(name));
-        QGuiApplication::setDesktopFileName(QString::fromUtf8(name));
+    }
+    if (desktop_file && *desktop_file) {
+        QGuiApplication::setDesktopFileName(QString::fromUtf8(desktop_file));
     }
     if (organization && *organization) {
         QCoreApplication::setOrganizationName(QString::fromUtf8(organization));
@@ -927,7 +939,7 @@ extern "C" bool notify(const char* app, const char* title, const char* body) {
     }
 
     QVariantMap hints;
-    hints.insert(QStringLiteral("desktop-entry"), QString::fromUtf8(app));
+    hints.insert(QStringLiteral("desktop-entry"), QGuiApplication::desktopFileName());
 
     const QDBusReply<uint> reply = notifications.call(QStringLiteral("Notify"), QString::fromUtf8(app), 0u, QString(), QString::fromUtf8(title),
                                                       QString::fromUtf8(body), QStringList(), hints, -1);

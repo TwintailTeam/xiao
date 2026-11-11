@@ -477,6 +477,7 @@ Window {
     function startBrowsing() {
         root.appProfile = profilePrototype.instance()
         root.appProfile.downloadPath = root.storage.downloadPath
+        root.appProfile.downloadRequested.connect(root.handleDownload)
         view.profile = root.appProfile
 
         if (backend.injectsScripts()) {
@@ -486,6 +487,25 @@ Window {
         }
 
         view.url = backend.startUrl()
+    }
+
+    function handleDownload(download) {
+        const url = download.url.toString()
+        const security = (root.cfg.app && root.cfg.app.security) || {}
+        if (!security.page || security.page.downloads !== true) {
+            console.warn("[download] refused " + url + ": set app.security.page.downloads to true to allow downloads")
+            return
+        }
+
+        download.accept()
+        const info = { id: download.id, url: url, path: download.downloadDirectory + "/" + download.downloadFileName }
+        backend.notifyDownloadEvent("started", JSON.stringify(info))
+        download.isFinishedChanged.connect(function() {
+            if (!download.isFinished)
+                return
+            info.completed = download.state === WebEngineDownloadRequest.DownloadCompleted
+            backend.notifyDownloadEvent("finished", JSON.stringify(info))
+        })
     }
 
     function initialScripts() {

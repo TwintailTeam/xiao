@@ -49,7 +49,7 @@ pub fn stub_project(conf: &Conf) -> Result<PathBuf, String> {
     let icon = dir.join("icon.res");
     match conf.icons().into_iter().find(|icon| icon.ends_with(".ico")) {
         Some(relative) => {
-            let ico = conf.asset(&relative);
+            let ico = conf.root.join(&relative);
             let bytes = std::fs::read(&ico).map_err(|e| format!("{}: {e}", ico.display()))?;
             write_if_changed(&icon, &icon_res(&bytes).map_err(|e| format!("{}: {e}", ico.display()))?)?;
         }
@@ -105,9 +105,7 @@ fn pack(conf: &Conf, stub: &Path, stage: &Path, exe: &str, target: &Path) -> Res
         return Err(format!("{} has data after its last section", stub.display()));
     }
 
-    let mut files = Vec::new();
-    walk(stage, stage, &mut files);
-    files.sort();
+    let files = relative_files(stage);
 
     let io = |e: std::io::Error| e.to_string();
     let mut out = BufWriter::new(File::create(target).map_err(io)?);
@@ -159,26 +157,8 @@ impl Write for Hashed {
     fn flush(&mut self) -> std::io::Result<()> { self.out.flush() }
 }
 
-fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(base, &path, found);
-        } else if let Ok(relative) = path.strip_prefix(base) {
-            found.push(relative.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
-        }
-    }
-}
-
 fn write_if_changed(path: &Path, contents: &[u8]) -> Result<(), String> {
-    if std::fs::read(path).is_ok_and(|current| current == contents) {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, contents).map_err(|e| format!("writing {}: {e}", path.display()))
+    if std::fs::read(path).is_ok_and(|current| current == contents) { Ok(()) } else { write(path, contents) }
 }
 
 const RT_ICON: u16 = 3;

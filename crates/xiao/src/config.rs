@@ -13,6 +13,8 @@ pub(crate) fn config() -> &'static Value { PARSED.get_or_init(|| serde_json::fro
 
 pub(crate) fn product_name() -> &'static str { config()["productName"].as_str().unwrap_or("app") }
 
+pub(crate) fn binary_name() -> &'static str { config()["mainBinaryName"].as_str().filter(|name| !name.is_empty()).unwrap_or_else(product_name) }
+
 pub(crate) fn version() -> &'static str { config()["version"].as_str().unwrap_or("0.0.0") }
 
 pub(crate) fn identifier() -> &'static str { config()["identifier"].as_str().unwrap_or("com.example.app") }
@@ -55,25 +57,16 @@ fn locate_resource_dir() -> Option<PathBuf> {
         return Some(exe_dir.join("../Resources"));
     }
 
-    let installed = exe_dir.join("../lib").join(identifier());
-    if installed.is_dir() {
-        return Some(installed);
+    for prefix in ["..", "../../.."] {
+        let installed = exe_dir.join(prefix).join("lib").join(identifier());
+        if installed.is_dir() {
+            return Some(installed);
+        }
     }
     match std::env::var_os("APPDIR") {
         Some(appdir) => Some(PathBuf::from(appdir).join("usr/lib").join(identifier())),
         None => Some(PathBuf::from("/usr/lib").join(identifier())),
     }
-}
-
-fn declared_resources() -> Vec<PathBuf> {
-    config()["bundle"]["resources"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.as_str())
-        .map(|entry| resource_relpath(Path::new(entry)))
-        .filter(|relative| !relative.as_os_str().is_empty())
-        .collect()
 }
 
 fn resource_relpath(entry: &Path) -> PathBuf {
@@ -125,15 +118,15 @@ pub(crate) fn resolve_resource(relative: &str) -> Option<PathBuf> {
 
 pub(crate) fn resource_scopes() -> Vec<PathBuf> {
     let Some(root) = resource_dir() else { return Vec::new() };
-    declared_resources().into_iter().filter_map(|entry| root.join(entry).canonicalize().ok()).collect()
-}
-
-fn bundle_icons() -> Vec<&'static str> {
-    match &config()["bundle"]["icon"] {
-        Value::Array(items) => items.iter().filter_map(|item| item.as_str()).collect(),
-        Value::String(one) => vec![one.as_str()],
-        _ => Vec::new(),
-    }
+    config()["bundle"]["resources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.as_str())
+        .map(|entry| resource_relpath(Path::new(entry)))
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .filter_map(|entry| root.join(entry).canonicalize().ok())
+        .collect()
 }
 
 fn largest_png() -> Option<&'static str> {
@@ -146,7 +139,12 @@ fn largest_png() -> Option<&'static str> {
             .unwrap_or(u32::MAX)
     }
 
-    bundle_icons().into_iter().filter(|path| path.ends_with(".png")).max_by_key(|path| pixels(path))
+    let icons: Vec<&str> = match &config()["bundle"]["icon"] {
+        Value::Array(items) => items.iter().filter_map(|item| item.as_str()).collect(),
+        Value::String(one) => vec![one.as_str()],
+        _ => Vec::new(),
+    };
+    icons.into_iter().filter(|path| path.ends_with(".png")).max_by_key(|path| pixels(path))
 }
 
 pub(crate) fn tray_icon_url() -> String { embedded_icon_name().map(|icon| format!("qrc{EMBEDDED}/icons/{icon}")).unwrap_or_default() }
@@ -183,10 +181,17 @@ fn render_csp(value: &Value) -> Option<String> {
     }
 }
 
+const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'";
+
 pub(crate) fn active_csp() -> Option<String> {
     let security = &config()["app"]["security"];
-    let key = if crate::bridge::is_dev_mode() { "devCsp" } else { "csp" };
-    render_csp(&security[key])
+    if crate::bridge::is_dev_mode() {
+        return render_csp(&security["devCsp"]);
+    }
+    match security.get("csp") {
+        Some(policy) => render_csp(policy),
+        None => Some(DEFAULT_CSP.to_owned()),
+    }
 }
 
 pub(crate) fn web_storage() -> Value {

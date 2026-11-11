@@ -8,8 +8,6 @@ mod macos;
 mod qt;
 #[cfg(target_os = "linux")]
 mod rpm;
-#[cfg(target_os = "linux")]
-mod tool;
 mod util;
 mod vcredist;
 mod windows_portable;
@@ -24,6 +22,10 @@ usage:
   xiao dev                       run the frontend dev server and the app, restarting on change
   xiao bundle [targets…]         build in release and package (default: bundle.targets)
 
+options:
+  -c, --config <file|json>       merge a JSON file or inline JSON over xiao.conf.json (JSON Merge Patch);
+                                 repeat it to merge several, in the order given
+
 bundle options:
   --target <triple>              build for another target triple
                                  (universal-apple-darwin on macOS: both Mac architectures in one binary)
@@ -36,7 +38,8 @@ targets:
   macos-app                      a self-contained macOS .app (sign it and build the dmg in CI)
   windows-portable               a Windows folder with the Qt runtime, runs unzipped (build the installer in CI)
   windows-sfx                    one Windows .exe that unpacks that folder to %LOCALAPPDATA%\\Programs on first run
-every path and name comes from xiao.conf.json next to your project root.
+every path and name comes from xiao.conf.json next to your project root. xiao.linux.conf.json,
+xiao.windows.conf.json and xiao.macos.conf.json next to it are merged over it for that platform.
 ";
 
 fn main() {
@@ -48,51 +51,54 @@ fn main() {
         return;
     }
 
-    let conf = match Conf::load() {
-        Ok(conf) => conf,
-        Err(e) => fail(&e),
-    };
-
-    let result = match command {
-        "dev" => dev::run(&conf),
-        "bundle" | "build" => match parse_bundle_options(&args[1..]) {
-            Ok(opts) => bundle::run(&conf, &opts),
-            Err(e) => Err(e),
-        },
+    let bundling = match command {
+        "dev" => false,
+        "bundle" | "build" => true,
         other => {
             print!("{USAGE}");
             fail(&format!("unknown command `{other}`"));
         }
     };
 
+    let result = parse_options(&args[1..], bundling).and_then(|opts| {
+        if bundling {
+            bundle::run(&Conf::load(bundle::target_os(&opts), &opts.config)?, &opts)
+        } else {
+            dev::run(&Conf::load(std::env::consts::OS, &opts.config)?)
+        }
+    });
+
     if let Err(e) = result {
         fail(&e);
     }
 }
 
-fn parse_bundle_options(args: &[String]) -> Result<bundle::Options, String> {
-    let mut opts = bundle::Options { targets: Vec::new(), triple: std::env::var("CARGO_BUILD_TARGET").ok(), runner: None, no_bundle: false, debug: false };
+fn parse_options(args: &[String], bundling: bool) -> Result<bundle::Options, String> {
+    let mut opts = bundle::Options {
+        targets: Vec::new(),
+        triple: std::env::var("CARGO_BUILD_TARGET").ok(),
+        runner: None,
+        no_bundle: false,
+        debug: false,
+        config: Vec::new(),
+    };
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        let mut take = |name: &str| -> Result<String, String> { rest.next().cloned().ok_or_else(|| format!("--{name} needs a value")) };
+        let (name, mut inline) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_owned())),
+            _ => (arg.as_str(), None),
+        };
+        let mut value = || inline.take().or_else(|| rest.next().cloned()).ok_or_else(|| format!("{name} needs a value"));
 
-        match arg.as_str() {
-            "--target" => opts.triple = Some(take("target")?),
-            "--runner" => opts.runner = Some(take("runner")?),
-            "--no-bundle" => opts.no_bundle = true,
-            "--debug" => opts.debug = true,
-            _ => {
-                if let Some(value) = arg.strip_prefix("--target=") {
-                    opts.triple = Some(value.to_owned());
-                } else if let Some(value) = arg.strip_prefix("--runner=") {
-                    opts.runner = Some(value.to_owned());
-                } else if arg.starts_with('-') {
-                    return Err(format!("unknown option `{arg}`"));
-                } else {
-                    opts.targets.push(arg.clone());
-                }
-            }
+        match name {
+            "-c" | "--config" => opts.config.push(value()?),
+            "--target" if bundling => opts.triple = Some(value()?),
+            "--runner" if bundling => opts.runner = Some(value()?),
+            "--no-bundle" if bundling => opts.no_bundle = true,
+            "--debug" if bundling => opts.debug = true,
+            _ if bundling && !arg.starts_with('-') => opts.targets.push(arg.clone()),
+            _ => return Err(format!("unknown option `{arg}`")),
         }
     }
     Ok(opts)

@@ -3,12 +3,13 @@ use crate::qstring::QString;
 use cxx_qt::CxxQtThread;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static ATTACHED: AtomicBool = AtomicBool::new(false);
-static PENDING: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static PENDING: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
+const PENDING_LIMIT: usize = 512;
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 static RESTART: AtomicBool = AtomicBool::new(false);
@@ -59,7 +60,6 @@ impl AppHandle {
     /// Removes a listener. Unknown or already finished ids are ignored.
     pub fn unlisten(&self, id: EventId) { SUBSCRIPTIONS.lock().unwrap().retain(|s| s.id != id.0); }
 
-    /// The app's `xiao.conf.json`.
     pub fn config(&self) -> &'static Value { crate::config::config() }
 
     /// Manages `value` for the app's lifetime. Returns `false`, dropping
@@ -73,7 +73,6 @@ impl AppHandle {
     /// If no value of type `T` is managed.
     pub fn state<T: Send + Sync + 'static>(&self) -> crate::State<'static, T> { crate::state::state::<T>() }
 
-    /// The managed value of type `T`, if there is one.
     pub fn try_state<T: Send + Sync + 'static>(&self) -> Option<crate::State<'static, T>> { crate::state::try_state::<T>() }
 
     /// Runs `task` on the Qt thread.
@@ -98,28 +97,20 @@ impl AppHandle {
         self.exit(0);
     }
 
-    /// Standard and app-specific directories.
     pub fn path(&self) -> crate::path::PathResolver { crate::path::PathResolver::new() }
 
-    /// The app's window.
     pub fn window(&self) -> crate::window::WindowHandle<'_> { crate::window::WindowHandle { app: self } }
 
-    /// The tray icon.
     pub fn tray(&self) -> crate::tray::TrayHandle<'_> { crate::tray::TrayHandle { app: self } }
 
-    /// Opens URLs, files and folders with the desktop's applications.
     pub fn opener(&self) -> crate::opener::Opener { crate::opener::Opener::new() }
 
-    /// The system clipboard.
     pub fn clipboard(&self) -> crate::clipboard::Clipboard { crate::clipboard::Clipboard::new() }
 
-    /// URL schemes that open the app.
     pub fn deep_link(&self) -> crate::deep_link::DeepLinkHandle<'_> { crate::deep_link::DeepLinkHandle { app: self } }
 
-    /// Native file and message dialogs.
     pub fn dialog(&self) -> crate::dialog::DialogHandle<'_> { crate::dialog::DialogHandle { app: self } }
 
-    /// Lower-level access to the page and its web channel.
     pub fn webchannel(&self) -> crate::webchannel::WebChannelHandle<'_> { crate::webchannel::WebChannelHandle { app: self } }
 
     pub(crate) fn emit_json(&self, event: &str, json: String) {
@@ -131,12 +122,16 @@ impl AppHandle {
 
         if !ATTACHED.load(Ordering::Acquire) {
             trace!("[emit] {name} {json} (buffered)");
-            PENDING.lock().unwrap().push((name, json));
+            let mut pending = PENDING.lock().unwrap();
+            if pending.len() == PENDING_LIMIT {
+                pending.pop_front();
+            }
+            pending.push_back((name, json));
             return;
         }
 
         trace!("[emit] {name} {json}");
-        self.send(name, json);
+        crate::bridge::send_to_page(name, json);
     }
 
     pub(crate) fn window_command(&self, action: &str, args: Value) {
@@ -170,19 +165,17 @@ impl AppHandle {
         }
     }
 
-    fn send(&self, name: String, json: String) { crate::bridge::send_to_page(name, json); }
-
     pub(crate) fn attach_frontend(&self) {
         if ATTACHED.swap(true, Ordering::AcqRel) {
             return;
         }
 
-        let buffered: Vec<_> = std::mem::take(&mut *PENDING.lock().unwrap());
+        let buffered = std::mem::take(&mut *PENDING.lock().unwrap());
         if !buffered.is_empty() {
             trace!("[emit] flushing {} buffered event(s)", buffered.len());
         }
         for (name, json) in buffered {
-            self.send(name, json);
+            crate::bridge::send_to_page(name, json);
         }
         self.emit("app://ready", serde_json::json!({ "pid": std::process::id(), "renderer": "QtWebEngine", "version": crate::config::version() }));
     }
@@ -241,7 +234,7 @@ fn subscribe(event: &str, once: bool, handler: SharedHandler) -> EventId {
     EventId(id)
 }
 
-pub(crate) fn dispatch_event(app: &AppHandle, name: &str, payload: &Value) -> usize {
+fn dispatch_event(app: &AppHandle, name: &str, payload: &Value) {
     let matched: Vec<SharedHandler> = {
         let mut subscriptions = SUBSCRIPTIONS.lock().unwrap();
         let matched = subscriptions.iter().filter(|s| s.event == name).map(|s| Arc::clone(&s.handler)).collect();
@@ -250,7 +243,12 @@ pub(crate) fn dispatch_event(app: &AppHandle, name: &str, payload: &Value) -> us
     };
 
     for handler in &matched {
-        handler(app, payload.clone());
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(app, payload.clone()))) {
+            eprintln!("[app] a listener for `{name}` panicked: {}", panic_message(&panic));
+        }
     }
-    matched.len()
+}
+
+pub(crate) fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("no message")
 }

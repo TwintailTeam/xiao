@@ -2,7 +2,6 @@ use crate::app::{AppHandle, EventId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// What activated the tray icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TrayActivation {
     Unknown,
